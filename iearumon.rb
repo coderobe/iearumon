@@ -18,10 +18,10 @@ module Iearumon
   MESSAGE_CONTENT_INTENT = 1 << 15
   DEFAULT_WHISPER_COMMAND = "whisper"
   DEFAULT_WHISPER_MODEL = "base"
-  DEFAULT_COMMAND_PREFIX = "!iearumon"
   EAR_EMOJI = "👂"
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
+  SLASH_COMMAND_NAME = :iearumon
   DEFAULT_SETTINGS = {
     "auto_listen" => true,
     "reaction_emoji" => EAR_EMOJI
@@ -47,13 +47,11 @@ module Iearumon
       bot.debug("iearumon is online and listening for voice notes")
     end
 
+    register_slash_commands(bot)
+    register_slash_handlers(bot)
+
     bot.message do |event|
       begin
-        if command_message?(event.message)
-          handle_command(event.message)
-          next
-        end
-
         next unless auto_listen_enabled?(event.message)
         next unless voice_note_message?(event.message)
 
@@ -120,6 +118,73 @@ module Iearumon
     end
   end
 
+  def register_slash_commands(bot)
+    bot.register_application_command(
+      SLASH_COMMAND_NAME,
+      "Configure iearumon voice note transcription",
+      **application_command_registration_options
+    ) do |command|
+      command.subcommand("status", "Show the current iearumon settings")
+
+      command.subcommand("listen", "Enable or disable automatic voice note listening") do |subcommand|
+        subcommand.boolean("enabled", "Whether iearumon should automatically transcribe new voice notes", required: true)
+      end
+
+      command.subcommand("emoji", "Set the reaction emoji used for manual transcription") do |subcommand|
+        subcommand.string("value", "Emoji to use for reactions, like 👂 or :custom_emoji:", required: true)
+      end
+    end
+  end
+
+  def register_slash_handlers(bot)
+    command = bot.application_command(SLASH_COMMAND_NAME)
+
+    command.subcommand(:status) do |event|
+      event.respond(content: status_text(event), ephemeral: true)
+    rescue ConfigurationError => e
+      event.respond(content: e.message, ephemeral: true)
+    end
+
+    command.subcommand(:listen) do |event|
+      settings = update_settings_for(event) do |current|
+        current.merge("auto_listen" => !!event.options["enabled"])
+      end
+
+      event.respond(
+        content: "Automatic listening is now **#{settings.fetch("auto_listen") ? "enabled" : "disabled"}** for #{settings_scope_label(event)}.",
+        ephemeral: true
+      )
+    rescue ConfigurationError => e
+      event.respond(content: e.message, ephemeral: true)
+    end
+
+    command.subcommand(:emoji) do |event|
+      emoji = event.options["value"].to_s.strip
+      if emoji.empty?
+        event.respond(content: "Please provide an emoji to use for reactions.", ephemeral: true)
+        next
+      end
+
+      settings = update_settings_for(event) do |current|
+        current.merge("reaction_emoji" => emoji)
+      end
+
+      event.respond(
+        content: "Reaction emoji set to #{settings.fetch("reaction_emoji")} for #{settings_scope_label(event)}.",
+        ephemeral: true
+      )
+    rescue ConfigurationError => e
+      event.respond(content: e.message, ephemeral: true)
+    end
+  end
+
+  def application_command_registration_options
+    server_id = ENV["IEARUMON_COMMAND_SERVER_ID"]&.strip
+    return {} if server_id.nil? || server_id.empty?
+
+    { server_id: server_id }
+  end
+
   def reserve_transcription(message_id)
     @transcription_mutex.synchronize do
       prune_recent_transcriptions!
@@ -150,94 +215,16 @@ module Iearumon
     @recent_transcriptions.delete_if { |_message_id, timestamp| timestamp < cutoff }
   end
 
-  def command_message?(message)
-    message.content.to_s.strip.start_with?(command_prefix)
-  end
-
-  def handle_command(message)
-    command = message.content.to_s.strip.delete_prefix(command_prefix).strip
-    args = command.split(/\s+/, 3)
-
-    case args[0]&.downcase
-    when nil, "", "help"
-      reply_with_chunks(message, help_text(message))
-    when "status"
-      reply_with_chunks(message, status_text(message))
-    when "listen"
-      handle_listen_command(message, args[1])
-    when "emoji"
-      handle_emoji_command(message, args[1..].compact.join(" ").strip)
-    else
-      reply_with_chunks(message, "Unknown command.\n\n#{help_text(message)}")
-    end
-  end
-
-  def handle_listen_command(message, value)
-    enabled =
-      case value&.downcase
-      when "on", "enable", "enabled", "true"
-        true
-      when "off", "disable", "disabled", "false"
-        false
-      end
-
-    unless [true, false].include?(enabled)
-      reply_with_chunks(message, "Usage: `#{command_prefix} listen on` or `#{command_prefix} listen off`")
-      return
-    end
-
-    settings = update_settings_for(message) do |current|
-      current.merge("auto_listen" => enabled)
-    end
-
-    reply_with_chunks(
-      message,
-      "Automatic listening is now **#{settings.fetch("auto_listen") ? "enabled" : "disabled"}** for #{settings_scope_label(message)}."
-    )
-  end
-
-  def handle_emoji_command(message, emoji)
-    if emoji.nil? || emoji.empty?
-      reply_with_chunks(message, "Usage: `#{command_prefix} emoji #{reaction_emoji_for(message)}`")
-      return
-    end
-
-    settings = update_settings_for(message) do |current|
-      current.merge("reaction_emoji" => emoji)
-    end
-
-    reply_with_chunks(
-      message,
-      "Reaction emoji set to #{settings.fetch("reaction_emoji")} for #{settings_scope_label(message)}."
-    )
-  end
-
-  def help_text(message)
-    <<~TEXT.strip
-      Commands:
-      `#{command_prefix} status` — show the current settings for #{settings_scope_label(message)}.
-      `#{command_prefix} listen on` — automatically transcribe new voice notes.
-      `#{command_prefix} listen off` — stop automatically transcribing new voice notes.
-      `#{command_prefix} emoji #{reaction_emoji_for(message)}` — set the reaction emoji used by the bot.
-
-      Manual trigger: react to a voice note with #{reaction_emoji_for(message)} and I'll transcribe it.
-    TEXT
-  end
-
-  def status_text(message)
-    settings = settings_for(message)
+  def status_text(context)
+    settings = settings_for(context)
 
     <<~TEXT.strip
-      Settings for #{settings_scope_label(message)}:
+      Settings for #{settings_scope_label(context)}:
       Auto listening: **#{settings.fetch("auto_listen") ? "on" : "off"}**
       Reaction emoji: #{settings.fetch("reaction_emoji")}
 
       Manual trigger: react to a voice note with #{settings.fetch("reaction_emoji")}.
     TEXT
-  end
-
-  def command_prefix
-    ENV.fetch("IEARUMON_COMMAND_PREFIX", DEFAULT_COMMAND_PREFIX)
   end
 
   def auto_listen_enabled?(message)
