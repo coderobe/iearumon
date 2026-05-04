@@ -35,18 +35,7 @@ module Iearumon
   SLASH_COMMAND_NAME = :iearumon
   STATS_EMBED_COLOR = 0x5865F2
   DM_EMBED_COLOR = 0xFEE75C
-  AUDIO_FILE_EXTENSIONS = Set[
-    ".aac",
-    ".flac",
-    ".m4a",
-    ".mp3",
-    ".mp4",
-    ".oga",
-    ".ogg",
-    ".opus",
-    ".wav",
-    ".webm"
-  ].freeze
+  VOICE_NOTE_FILENAME = "voice-message.ogg"
   DEFAULT_SERVER_STATS = {
     "total_transcriptions" => 0,
     "seconds_transcribed" => 0
@@ -388,10 +377,7 @@ module Iearumon
   end
 
   def voice_note_message?(message)
-    voice_flag = Discordrb::Message::FLAGS.fetch(:voice_message)
-
-    ((message.flags || 0) & voice_flag).positive? ||
-      message.attachments.any? { |attachment| voice_note_attachment?(attachment) }
+    message.attachments.any? { |attachment| voice_note_attachment?(attachment) }
   end
 
   def voice_note_attachment(message)
@@ -399,19 +385,7 @@ module Iearumon
   end
 
   def voice_note_attachment?(attachment)
-    audio_attachment?(attachment) || voice_note_metadata?(attachment) || audio_filename?(attachment.filename)
-  end
-
-  def voice_note_metadata?(attachment)
-    attachment.duration_seconds || attachment.waveform
-  end
-
-  def audio_attachment?(attachment)
-    attachment.content_type&.start_with?("audio/")
-  end
-
-  def audio_filename?(filename)
-    AUDIO_FILE_EXTENSIONS.include?(File.extname(filename.to_s).downcase)
+    attachment.filename.to_s.downcase == VOICE_NOTE_FILENAME
   end
 
   def with_downloaded_attachment(message, attachment)
@@ -739,7 +713,7 @@ module Iearumon
       embed.add_field(name: "Transcriptions", value: "**#{format_integer(stats.fetch("total_transcriptions"))}** total", inline: true)
       embed.add_field(
         name: "Audio processed",
-        value: "**#{duration_summary(stats.fetch("seconds_transcribed"))}**\n#{format_integer(stats.fetch("seconds_transcribed"))} sec",
+        value: "#{duration_summary(stats.fetch("seconds_transcribed"))}\n#{format_integer(stats.fetch("seconds_transcribed"))} sec",
         inline: true
       )
       embed.add_field(

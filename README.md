@@ -41,7 +41,7 @@ Discord bot that transcribes Discord voice notes with a local Whisper CLI.
 
 ## Behavior
 
-- Automatically transcribes new voice notes by default
+- Automatically transcribes new `voice-message.ogg` voice-note attachments by default
 - DMs are controlled globally with `IEARUMON_DM_ENABLED` and are disabled by default
 - Manual transcription is triggered by reacting with `👂`
 - Per-server transcription totals and per-scope settings are stored in `iearumon_settings.json`
