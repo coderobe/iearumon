@@ -1,0 +1,41 @@
+[Unit]
+Description=Iearumon Discord voice note transcription bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iearumon
+Group=iearumon
+WorkingDirectory=/opt/iearumon
+EnvironmentFile=/etc/iearumon/iearumon.env
+ExecStart=/usr/bin/env bundle exec ruby /opt/iearumon/iearumon.rb
+Restart=on-failure
+RestartSec=5
+
+# Keep the service isolated and prevent writes outside its state paths.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+# The bot needs a writable working tree for settings and temp files.
+ReadWritePaths=/opt/iearumon
+
+[Install]
+WantedBy=multi-user.target
