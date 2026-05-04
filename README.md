@@ -29,6 +29,7 @@ Discord bot that transcribes Discord voice notes with a local Whisper CLI.
    ```sh
    WHISPER_COMMAND=whisper
    WHISPER_LANGUAGE=en
+   IEARUMON_DM_ENABLED=false
    IEARUMON_COMMAND_SERVER_ID=123456789012345678
    ```
 
@@ -41,11 +42,11 @@ Discord bot that transcribes Discord voice notes with a local Whisper CLI.
 ## Behavior
 
 - Automatically transcribes new voice notes by default
-- DMs are blocked by default until enabled with `/iearumon dm enabled:true`
+- DMs are controlled globally with `IEARUMON_DM_ENABLED` and are disabled by default
 - Manual transcription is triggered by reacting with `👂`
-- Per-server transcription totals and DM/server settings are stored in `iearumon_settings.json`
+- Per-server transcription totals and per-scope settings are stored in `iearumon_settings.json`
 - Server-wide `/iearumon listen` and `/iearumon emoji` changes require the Discord `Manage Server` permission
-- Slash commands: `/iearumon status`, `/iearumon listen`, `/iearumon emoji`, `/iearumon dm`
+- Slash commands: `/iearumon status`, `/iearumon listen`, `/iearumon emoji`
 
 ## Optional safety tuning
 

@@ -28,6 +28,7 @@ module Iearumon
   DEFAULT_TRANSCRIPTION_TIMEOUT = 1800
   DEFAULT_TRANSCRIPTION_WORKERS = 2
   DEFAULT_TRANSCRIPTION_QUEUE_LIMIT = 24
+  DEFAULT_DM_ENABLED = false
   EAR_EMOJI = "👂"
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
@@ -57,8 +58,7 @@ module Iearumon
   }.freeze
   DEFAULT_DM_SETTINGS = {
     "auto_listen" => true,
-    "reaction_emoji" => EAR_EMOJI,
-    "dm_enabled" => false
+    "reaction_emoji" => EAR_EMOJI
   }.freeze
 
   @settings_mutex = Mutex.new
@@ -89,7 +89,7 @@ module Iearumon
     bot.message do |event|
       begin
         next unless voice_note_message?(event.message)
-        next unless dm_transcription_allowed_for?(event.message) || reply_dm_disabled_message(event.message)
+        next if dm_ignored?(event.message)
         next unless auto_listen_enabled?(event.message)
 
         enqueue_transcription(bot, event.message)
@@ -104,7 +104,7 @@ module Iearumon
         next if bot_user?(event.user)
         next unless voice_note_message?(event.message)
         next unless reaction_matches?(event.emoji, reaction_emoji_for(event.message))
-        next unless dm_transcription_allowed_for?(event.message) || reply_dm_disabled_message(event.message)
+        next if dm_ignored?(event.message)
 
         enqueue_transcription(bot, event.message)
       rescue ConfigurationError => e
@@ -125,8 +125,8 @@ module Iearumon
   def discord_intents
     Discordrb::INTENTS.fetch(:server_messages) |
       Discordrb::INTENTS.fetch(:server_message_reactions) |
-      Discordrb::INTENTS.fetch(:direct_messages) |
-      Discordrb::INTENTS.fetch(:direct_message_reactions) |
+      (global_dm_enabled? ? Discordrb::INTENTS.fetch(:direct_messages) : 0) |
+      (global_dm_enabled? ? Discordrb::INTENTS.fetch(:direct_message_reactions) : 0) |
       MESSAGE_CONTENT_INTENT
   end
 
@@ -175,10 +175,6 @@ module Iearumon
 
       command.subcommand("emoji", "Set the reaction emoji used for manual transcription") do |subcommand|
         subcommand.string("value", "Emoji to use for reactions, like 👂 or :custom_emoji:", required: true)
-      end
-
-      command.subcommand("dm", "Enable or disable voice note transcription in this DM") do |subcommand|
-        subcommand.boolean("enabled", "Whether iearumon should transcribe voice notes in this DM", required: true)
       end
     end
   end
@@ -239,31 +235,15 @@ module Iearumon
       event.respond(content: user_configuration_error_message(event), ephemeral: true)
     end
 
-    command.subcommand(:dm) do |event|
-      if event.server
-        event.respond(content: "The DM setting can only be changed in a direct message with the bot.", ephemeral: true)
-        next
-      end
-
-      settings = update_settings_for(event) do |current|
-        current.merge("dm_enabled" => !!event.options["enabled"])
-      end
-
-      event.respond(
-        content: "DM transcription is now **#{settings.fetch("dm_enabled") ? "enabled" : "disabled"}** for this DM.",
-        ephemeral: true
-      )
-    rescue ConfigurationError => e
-      bot.debug("dm command failed: #{e.class}: #{e.message}")
-      event.respond(content: user_configuration_error_message(event), ephemeral: true)
-    end
   end
 
   def application_command_registration_options
     server_id = ENV["IEARUMON_COMMAND_SERVER_ID"]&.strip
-    return {} if server_id.nil? || server_id.empty?
+    return { server_id: server_id } unless server_id.nil? || server_id.empty?
 
-    { server_id: server_id }
+    return {} if global_dm_enabled?
+
+    { contexts: [0] }
   end
 
   def reserve_transcription(message_id)
@@ -357,25 +337,26 @@ module Iearumon
     message.server ? "this server" : "this DM"
   end
 
-  def dm_transcription_allowed_for?(context)
-    return true if context.server
-
-    settings_for(context).fetch("dm_enabled")
-  end
-
   def ensure_dm_transcription_allowed!(context)
-    return if dm_transcription_allowed_for?(context)
+    return if context.server || global_dm_enabled?
 
     raise TranscriptionError, dm_disabled_message
   end
 
-  def reply_dm_disabled_message(message)
-    reply_with_chunks(message, dm_disabled_message)
+  def global_dm_enabled?
+    @global_dm_enabled ||= boolean_env("IEARUMON_DM_ENABLED", DEFAULT_DM_ENABLED)
+  end
+
+  def dm_ignored?(context)
+    return false if context.server
+    return false if global_dm_enabled?
+
+    log_info("ignoring DM interaction because DMs are disabled", scope: settings_scope_key(context), channel_id: context.channel.id)
     true
   end
 
   def dm_disabled_message
-    "DM transcription is disabled by default. Run `/iearumon dm enabled:true` here first if you want me to transcribe voice notes in DMs."
+    "DM support is disabled for this bot."
   end
 
   def add_processing_reaction(message)
@@ -586,6 +567,20 @@ module Iearumon
     raise ConfigurationError, "#{name} must be a positive integer."
   end
 
+  def boolean_env(name, default)
+    raw_value = ENV[name]&.strip
+    return default if raw_value.nil? || raw_value.empty?
+
+    case raw_value.downcase
+    when "1", "true", "yes", "on"
+      true
+    when "0", "false", "no", "off"
+      false
+    else
+      raise ConfigurationError, "#{name} must be true/false."
+    end
+  end
+
   def download_open_timeout
     @download_open_timeout ||= positive_integer_env("IEARUMON_DOWNLOAD_OPEN_TIMEOUT", DEFAULT_DOWNLOAD_OPEN_TIMEOUT)
   end
@@ -753,10 +748,10 @@ module Iearumon
         inline: false
       )
     else
-      embed.add_field(name: "DM transcription", value: enabled_label(settings.fetch("dm_enabled")), inline: true)
+      embed.add_field(name: "DM access", value: enabled_label(global_dm_enabled?), inline: true)
       embed.add_field(
         name: "How it works",
-        value: settings.fetch("dm_enabled") ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes." : "Run `/iearumon dm enabled:true` here first if you want DM voice note transcription.",
+        value: global_dm_enabled? ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes." : "Set `IEARUMON_DM_ENABLED=true` in the bot environment to allow DM interactions.",
         inline: false
       )
     end
