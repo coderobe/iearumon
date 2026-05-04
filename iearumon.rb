@@ -22,6 +22,18 @@ module Iearumon
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
   SLASH_COMMAND_NAME = :iearumon
+  AUDIO_FILE_EXTENSIONS = Set[
+    ".aac",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".oga",
+    ".ogg",
+    ".opus",
+    ".wav",
+    ".webm"
+  ].freeze
   DEFAULT_SETTINGS = {
     "auto_listen" => true,
     "reaction_emoji" => EAR_EMOJI
@@ -109,12 +121,17 @@ module Iearumon
     return unless reserve_transcription(message.id)
 
     Thread.new do
-      handle_voice_note(message)
-      mark_transcription_complete(message.id)
-    rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
-      clear_transcription_reservation(message.id)
-      bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
-      reply_with_chunks(message, "I couldn't transcribe that voice note: #{e.message}")
+      completed = false
+
+      begin
+        handle_voice_note(message)
+        completed = true
+      rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
+        bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
+        reply_with_chunks(message, "I couldn't transcribe that voice note: #{e.message}")
+      ensure
+        completed ? mark_transcription_complete(message.id) : clear_transcription_reservation(message.id)
+      end
     end
   end
 
@@ -293,11 +310,15 @@ module Iearumon
     voice_flag = Discordrb::Message::FLAGS.fetch(:voice_message)
 
     ((message.flags || 0) & voice_flag).positive? ||
-      message.attachments.any? { |attachment| voice_note_metadata?(attachment) }
+      message.attachments.any? { |attachment| voice_note_attachment?(attachment) }
   end
 
   def voice_note_attachment(message)
-    message.attachments.find { |attachment| audio_attachment?(attachment) }
+    message.attachments.find { |attachment| voice_note_attachment?(attachment) }
+  end
+
+  def voice_note_attachment?(attachment)
+    audio_attachment?(attachment) || voice_note_metadata?(attachment) || audio_filename?(attachment.filename)
   end
 
   def voice_note_metadata?(attachment)
@@ -306,6 +327,10 @@ module Iearumon
 
   def audio_attachment?(attachment)
     attachment.content_type&.start_with?("audio/")
+  end
+
+  def audio_filename?(filename)
+    AUDIO_FILE_EXTENSIONS.include?(File.extname(filename.to_s).downcase)
   end
 
   def with_downloaded_attachment(attachment)
@@ -347,8 +372,7 @@ module Iearumon
 
       transcript_path = File.join(output_dir, "#{File.basename(path, File.extname(path))}.txt")
       transcript = File.exist?(transcript_path) ? File.read(transcript_path).strip : ""
-
-      return transcript unless !status.success? || transcript.empty?
+      return transcript if status.success? && !transcript.empty?
 
       error_output = [stderr, stdout].reject(&:empty?).join("\n").strip
       raise TranscriptionError, error_output.empty? ? "Whisper did not return any transcription text." : error_output
