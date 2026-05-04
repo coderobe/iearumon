@@ -10,15 +10,23 @@ require "shellwords"
 require "set"
 require "socket"
 require "tempfile"
+require "timeout"
 require "tmpdir"
 
 module Iearumon
+  class AuthorizationError < StandardError; end
   class ConfigurationError < StandardError; end
   class TranscriptionError < StandardError; end
 
   MESSAGE_CONTENT_INTENT = 1 << 15
   DEFAULT_WHISPER_COMMAND = "whisper"
   DEFAULT_WHISPER_MODEL = "base"
+  DEFAULT_DOWNLOAD_OPEN_TIMEOUT = 15
+  DEFAULT_DOWNLOAD_READ_TIMEOUT = 300
+  DEFAULT_MAX_AUDIO_BYTES = 64 * 1024 * 1024
+  DEFAULT_TRANSCRIPTION_TIMEOUT = 1800
+  DEFAULT_TRANSCRIPTION_WORKERS = 2
+  DEFAULT_TRANSCRIPTION_QUEUE_LIMIT = 24
   EAR_EMOJI = "👂"
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
@@ -42,6 +50,7 @@ module Iearumon
 
   @settings_mutex = Mutex.new
   @transcription_mutex = Mutex.new
+  @worker_mutex = Mutex.new
   @messages_in_progress = Set.new
   @recent_transcriptions = {}
 
@@ -71,7 +80,7 @@ module Iearumon
         enqueue_transcription(bot, event.message)
       rescue ConfigurationError => e
         bot.debug("message handling failed: #{e.class}: #{e.message}")
-        reply_with_chunks(event.message, e.message)
+        reply_with_chunks(event.message, user_configuration_error_message(event))
       end
     end
 
@@ -84,7 +93,7 @@ module Iearumon
         enqueue_transcription(bot, event.message)
       rescue ConfigurationError => e
         bot.debug("reaction handling failed: #{e.class}: #{e.message}")
-        reply_with_chunks(event.message, e.message)
+        reply_with_chunks(event.message, user_configuration_error_message(event))
       end
     end
 
@@ -121,19 +130,11 @@ module Iearumon
   def enqueue_transcription(bot, message)
     return unless reserve_transcription(message.id)
 
-    Thread.new do
-      completed = false
-
-      begin
-        handle_voice_note(message)
-        completed = true
-      rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
-        bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
-        reply_with_chunks(message, "I couldn't transcribe that voice note: #{e.message}")
-      ensure
-        completed ? mark_transcription_complete(message.id) : clear_transcription_reservation(message.id)
-      end
-    end
+    ensure_transcription_workers_running(bot)
+    transcription_queue.push(message, true)
+  rescue ThreadError
+    clear_transcription_reservation(message.id)
+    reply_with_chunks(message, "I'm already working through a full transcription backlog right now. Please try that voice note again in a little while.")
   end
 
   def register_slash_commands(bot)
@@ -160,10 +161,13 @@ module Iearumon
     command.subcommand(:status) do |event|
       event.respond(content: status_text(event), ephemeral: true)
     rescue ConfigurationError => e
-      event.respond(content: e.message, ephemeral: true)
+      bot.debug("status command failed: #{e.class}: #{e.message}")
+      event.respond(content: user_configuration_error_message(event), ephemeral: true)
     end
 
     command.subcommand(:listen) do |event|
+      authorize_settings_change!(event)
+
       settings = update_settings_for(event) do |current|
         current.merge("auto_listen" => !!event.options["enabled"])
       end
@@ -172,11 +176,16 @@ module Iearumon
         content: "Automatic listening is now **#{settings.fetch("auto_listen") ? "enabled" : "disabled"}** for #{settings_scope_label(event)}.",
         ephemeral: true
       )
-    rescue ConfigurationError => e
+    rescue AuthorizationError => e
       event.respond(content: e.message, ephemeral: true)
+    rescue ConfigurationError => e
+      bot.debug("listen command failed: #{e.class}: #{e.message}")
+      event.respond(content: user_configuration_error_message(event), ephemeral: true)
     end
 
     command.subcommand(:emoji) do |event|
+      authorize_settings_change!(event)
+
       emoji = event.options["value"].to_s.strip
       if emoji.empty?
         event.respond(content: "Please provide an emoji to use for reactions.", ephemeral: true)
@@ -191,8 +200,11 @@ module Iearumon
         content: "Reaction emoji set to #{settings.fetch("reaction_emoji")} for #{settings_scope_label(event)}.",
         ephemeral: true
       )
-    rescue ConfigurationError => e
+    rescue AuthorizationError => e
       event.respond(content: e.message, ephemeral: true)
+    rescue ConfigurationError => e
+      bot.debug("emoji command failed: #{e.class}: #{e.message}")
+      event.respond(content: user_configuration_error_message(event), ephemeral: true)
     end
   end
 
@@ -295,6 +307,13 @@ module Iearumon
     message.server ? "this server" : "this DM"
   end
 
+  def authorize_settings_change!(event)
+    return unless event.server
+    return if event.user.respond_to?(:can_manage_server?) && event.user.can_manage_server?
+
+    raise AuthorizationError, "You need the Manage Server permission to change iearumon settings for this server."
+  end
+
   def reaction_matches?(emoji, configured_emoji)
     reaction_string(emoji) == configured_emoji
   end
@@ -335,19 +354,35 @@ module Iearumon
   end
 
   def with_downloaded_attachment(attachment)
+    attachment_size = attachment.size.to_i
+    if attachment_size.positive? && attachment_size > max_audio_bytes
+      raise TranscriptionError, "That voice note is too large to transcribe safely. The current limit is #{byte_limit_label(max_audio_bytes)}."
+    end
+
     extension = File.extname(attachment.filename)
     extension = ".ogg" if extension.empty?
 
     Tempfile.create(["iearumon-voice-note", extension], binmode: true) do |file|
-      URI.open(attachment.url, "rb") do |remote_file|
-        IO.copy_stream(remote_file, file)
+      URI.open(attachment.url, "rb", open_timeout: download_open_timeout, read_timeout: download_read_timeout) do |remote_file|
+        bytes_downloaded = 0
+
+        while (chunk = remote_file.read(64 * 1024))
+          bytes_downloaded += chunk.bytesize
+          if bytes_downloaded > max_audio_bytes
+            raise TranscriptionError, "That voice note is too large to transcribe safely. The current limit is #{byte_limit_label(max_audio_bytes)}."
+          end
+
+          file.write(chunk)
+        end
       end
       file.flush
 
       yield file.path
     end
-  rescue OpenURI::HTTPError, SocketError => e
-    raise TranscriptionError, "Discord wouldn't let me download that voice note: #{e.message}"
+  rescue Net::OpenTimeout, Net::ReadTimeout, Timeout::Error
+    raise TranscriptionError, "Discord took too long to send that voice note. Please try again in a moment."
+  rescue OpenURI::HTTPError, SocketError
+    raise TranscriptionError, "Discord wouldn't let me download that voice note."
   end
 
   def transcribe(path)
@@ -359,7 +394,8 @@ module Iearumon
     raise ConfigurationError, "Couldn't find `ffmpeg` in PATH." unless executable_available?("ffmpeg")
 
     Dir.mktmpdir("iearumon-whisper") do |output_dir|
-      stdout, stderr, status = Open3.capture3(
+      stdout, stderr, status = capture_command_with_timeout(
+        transcription_timeout,
         *whisper_command,
         path,
         "--model", ENV.fetch("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
@@ -375,8 +411,7 @@ module Iearumon
       transcript = File.exist?(transcript_path) ? File.read(transcript_path).strip : ""
       return transcript if status.success? && !transcript.empty?
 
-      error_output = [stderr, stdout].reject(&:empty?).join("\n").strip
-      raise TranscriptionError, error_output.empty? ? "Whisper did not return any transcription text." : error_output
+      raise TranscriptionError, "Whisper couldn't produce a transcription for that voice note."
     end
   end
 
@@ -393,6 +428,137 @@ module Iearumon
     ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).any? do |directory|
       File.executable?(File.join(directory, command))
     end
+  end
+
+  def positive_integer_env(name, default)
+    raw_value = ENV[name]&.strip
+    return default if raw_value.nil? || raw_value.empty?
+
+    value = Integer(raw_value, 10)
+    raise ArgumentError if value <= 0
+
+    value
+  rescue ArgumentError
+    raise ConfigurationError, "#{name} must be a positive integer."
+  end
+
+  def download_open_timeout
+    @download_open_timeout ||= positive_integer_env("IEARUMON_DOWNLOAD_OPEN_TIMEOUT", DEFAULT_DOWNLOAD_OPEN_TIMEOUT)
+  end
+
+  def download_read_timeout
+    @download_read_timeout ||= positive_integer_env("IEARUMON_DOWNLOAD_READ_TIMEOUT", DEFAULT_DOWNLOAD_READ_TIMEOUT)
+  end
+
+  def max_audio_bytes
+    @max_audio_bytes ||= positive_integer_env("IEARUMON_MAX_AUDIO_BYTES", DEFAULT_MAX_AUDIO_BYTES)
+  end
+
+  def transcription_timeout
+    @transcription_timeout ||= positive_integer_env("IEARUMON_TRANSCRIPTION_TIMEOUT", DEFAULT_TRANSCRIPTION_TIMEOUT)
+  end
+
+  def transcription_worker_count
+    @transcription_worker_count ||= positive_integer_env("IEARUMON_TRANSCRIPTION_WORKERS", DEFAULT_TRANSCRIPTION_WORKERS)
+  end
+
+  def transcription_queue_limit
+    @transcription_queue_limit ||= positive_integer_env("IEARUMON_TRANSCRIPTION_QUEUE_LIMIT", DEFAULT_TRANSCRIPTION_QUEUE_LIMIT)
+  end
+
+  def transcription_queue
+    @worker_mutex.synchronize do
+      @transcription_queue ||= SizedQueue.new(transcription_queue_limit)
+    end
+  end
+
+  def ensure_transcription_workers_running(bot)
+    @worker_mutex.synchronize do
+      return if @transcription_workers_started
+
+      transcription_worker_count.times do
+        Thread.new { transcription_worker_loop(bot) }
+      end
+
+      @transcription_workers_started = true
+    end
+  end
+
+  def transcription_worker_loop(bot)
+    loop do
+      message = transcription_queue.pop
+      completed = false
+
+      begin
+        handle_voice_note(message)
+        completed = true
+      rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
+        bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
+        reply_with_chunks(message, user_transcription_error_message(e))
+      rescue StandardError => e
+        bot.debug("voice note transcription failed unexpectedly: #{e.class}: #{e.message}")
+        reply_with_chunks(message, "I couldn't transcribe that voice note because an internal error occurred.")
+      ensure
+        completed ? mark_transcription_complete(message.id) : clear_transcription_reservation(message.id)
+      end
+    end
+  end
+
+  def capture_command_with_timeout(timeout_seconds, *command)
+    Open3.popen3(*command) do |stdin, stdout, stderr, wait_thread|
+      stdin.close
+
+      stdout_reader = Thread.new { stdout.read }
+      stderr_reader = Thread.new { stderr.read }
+
+      unless wait_thread.join(timeout_seconds)
+        terminate_process(wait_thread)
+        raise TranscriptionError, "Transcription took longer than #{duration_label(timeout_seconds)}. Please try again later."
+      end
+
+      [stdout_reader.value, stderr_reader.value, wait_thread.value]
+    ensure
+      stdout_reader&.join
+      stderr_reader&.join
+    end
+  end
+
+  def terminate_process(wait_thread)
+    pid = wait_thread.pid
+    Process.kill("TERM", pid)
+    return if wait_thread.join(5)
+
+    Process.kill("KILL", pid)
+    wait_thread.join
+  rescue Errno::ESRCH
+    wait_thread.join
+  end
+
+  def duration_label(seconds)
+    minutes = seconds / 60
+    return "#{seconds} seconds" if minutes.zero?
+    return "1 minute" if minutes == 1
+
+    "#{minutes} minutes"
+  end
+
+  def byte_limit_label(bytes)
+    megabytes = bytes.to_f / (1024 * 1024)
+    formatted = megabytes.round(1)
+    formatted = formatted.to_i if formatted == formatted.to_i
+    "#{formatted} MiB"
+  end
+
+  def user_configuration_error_message(context)
+    return "I couldn't read my configuration for this DM. Please check the bot logs." unless context.server
+
+    "I couldn't complete that action for this server. Please ask a server manager to check the bot logs."
+  end
+
+  def user_transcription_error_message(error)
+    return error.message if error.is_a?(TranscriptionError)
+
+    "I couldn't transcribe that voice note."
   end
 
   def reply_with_chunks(message, content)
