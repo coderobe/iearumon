@@ -1,6 +1,7 @@
 #!/usr/bin/env bundle exec ruby
 # frozen_string_literal: true
 
+require "dotenv/load"
 require "discordrb"
 require "json"
 require "open-uri"
@@ -114,7 +115,7 @@ module Iearumon
       transcribe(path)
     end
 
-    reply_with_chunks(message, "Transcription:\n#{transcript}")
+    reply_with_chunks(message, "#{transcript}")
   end
 
   def enqueue_transcription(bot, message)
