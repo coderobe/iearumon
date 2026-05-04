@@ -10,6 +10,7 @@ require "shellwords"
 require "set"
 require "socket"
 require "tempfile"
+require "time"
 require "timeout"
 require "tmpdir"
 
@@ -31,6 +32,8 @@ module Iearumon
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
   SLASH_COMMAND_NAME = :iearumon
+  STATS_EMBED_COLOR = 0x5865F2
+  DM_EMBED_COLOR = 0xFEE75C
   AUDIO_FILE_EXTENSIONS = Set[
     ".aac",
     ".flac",
@@ -43,9 +46,19 @@ module Iearumon
     ".wav",
     ".webm"
   ].freeze
-  DEFAULT_SETTINGS = {
+  DEFAULT_SERVER_STATS = {
+    "total_transcriptions" => 0,
+    "seconds_transcribed" => 0
+  }.freeze
+  DEFAULT_SERVER_SETTINGS = {
     "auto_listen" => true,
-    "reaction_emoji" => EAR_EMOJI
+    "reaction_emoji" => EAR_EMOJI,
+    "stats" => DEFAULT_SERVER_STATS
+  }.freeze
+  DEFAULT_DM_SETTINGS = {
+    "auto_listen" => true,
+    "reaction_emoji" => EAR_EMOJI,
+    "dm_enabled" => false
   }.freeze
 
   @settings_mutex = Mutex.new
@@ -66,6 +79,7 @@ module Iearumon
     )
 
     bot.ready do |_event|
+      log_info("bot is online", command_scope: application_command_registration_options[:server_id] || "global")
       bot.debug("iearumon is online and listening for voice notes")
     end
 
@@ -74,8 +88,9 @@ module Iearumon
 
     bot.message do |event|
       begin
-        next unless auto_listen_enabled?(event.message)
         next unless voice_note_message?(event.message)
+        next unless dm_transcription_allowed_for?(event.message) || reply_dm_disabled_message(event.message)
+        next unless auto_listen_enabled?(event.message)
 
         enqueue_transcription(bot, event.message)
       rescue ConfigurationError => e
@@ -89,6 +104,7 @@ module Iearumon
         next if bot_user?(event.user)
         next unless voice_note_message?(event.message)
         next unless reaction_matches?(event.emoji, reaction_emoji_for(event.message))
+        next unless dm_transcription_allowed_for?(event.message) || reply_dm_disabled_message(event.message)
 
         enqueue_transcription(bot, event.message)
       rescue ConfigurationError => e
@@ -117,14 +133,21 @@ module Iearumon
   def handle_voice_note(message)
     attachment = voice_note_attachment(message)
     raise TranscriptionError, "No voice note attachment was found." unless attachment
+    ensure_dm_transcription_allowed!(message)
 
-    message.react(reaction_emoji_for(message))
+    add_processing_reaction(message)
 
-    transcript = with_downloaded_attachment(attachment) do |path|
-      transcribe(path)
+    log_info("starting voice note processing", message_log_context(message, filename: attachment.filename))
+
+    transcript = with_downloaded_attachment(message, attachment) do |path|
+      duration_seconds = audio_duration_seconds(path, attachment)
+      transcript = transcribe(message, path)
+      record_successful_transcription(message, duration_seconds)
+      transcript
     end
 
-    reply_with_chunks(message, "#{transcript}")
+    log_info("completed voice note processing", message_log_context(message, transcript_characters: transcript.length))
+    reply_with_chunks(message, transcript.to_s)
   end
 
   def enqueue_transcription(bot, message)
@@ -132,6 +155,7 @@ module Iearumon
 
     ensure_transcription_workers_running(bot)
     transcription_queue.push(message, true)
+    log_info("queued voice note transcription", message_log_context(message, queue_depth: transcription_queue.length))
   rescue ThreadError
     clear_transcription_reservation(message.id)
     reply_with_chunks(message, "I'm already working through a full transcription backlog right now. Please try that voice note again in a little while.")
@@ -143,7 +167,7 @@ module Iearumon
       "Configure iearumon voice note transcription",
       **application_command_registration_options
     ) do |command|
-      command.subcommand("status", "Show the current iearumon settings")
+      command.subcommand("status", "Show the iearumon overview for this server or DM")
 
       command.subcommand("listen", "Enable or disable automatic voice note listening") do |subcommand|
         subcommand.boolean("enabled", "Whether iearumon should automatically transcribe new voice notes", required: true)
@@ -152,6 +176,10 @@ module Iearumon
       command.subcommand("emoji", "Set the reaction emoji used for manual transcription") do |subcommand|
         subcommand.string("value", "Emoji to use for reactions, like 👂 or :custom_emoji:", required: true)
       end
+
+      command.subcommand("dm", "Enable or disable voice note transcription in this DM") do |subcommand|
+        subcommand.boolean("enabled", "Whether iearumon should transcribe voice notes in this DM", required: true)
+      end
     end
   end
 
@@ -159,7 +187,11 @@ module Iearumon
     command = bot.application_command(SLASH_COMMAND_NAME)
 
     command.subcommand(:status) do |event|
-      event.respond(content: status_text(event), ephemeral: true)
+      event.respond(ephemeral: true) do |builder|
+        builder.add_embed do |embed|
+          populate_status_embed(embed, event)
+        end
+      end
     rescue ConfigurationError => e
       bot.debug("status command failed: #{e.class}: #{e.message}")
       event.respond(content: user_configuration_error_message(event), ephemeral: true)
@@ -206,6 +238,25 @@ module Iearumon
       bot.debug("emoji command failed: #{e.class}: #{e.message}")
       event.respond(content: user_configuration_error_message(event), ephemeral: true)
     end
+
+    command.subcommand(:dm) do |event|
+      if event.server
+        event.respond(content: "The DM setting can only be changed in a direct message with the bot.", ephemeral: true)
+        next
+      end
+
+      settings = update_settings_for(event) do |current|
+        current.merge("dm_enabled" => !!event.options["enabled"])
+      end
+
+      event.respond(
+        content: "DM transcription is now **#{settings.fetch("dm_enabled") ? "enabled" : "disabled"}** for this DM.",
+        ephemeral: true
+      )
+    rescue ConfigurationError => e
+      bot.debug("dm command failed: #{e.class}: #{e.message}")
+      event.respond(content: user_configuration_error_message(event), ephemeral: true)
+    end
   end
 
   def application_command_registration_options
@@ -245,18 +296,6 @@ module Iearumon
     @recent_transcriptions.delete_if { |_message_id, timestamp| timestamp < cutoff }
   end
 
-  def status_text(context)
-    settings = settings_for(context)
-
-    <<~TEXT.strip
-      Settings for #{settings_scope_label(context)}:
-      Auto listening: **#{settings.fetch("auto_listen") ? "on" : "off"}**
-      Reaction emoji: #{settings.fetch("reaction_emoji")}
-
-      Manual trigger: react to a voice note with #{settings.fetch("reaction_emoji")}.
-    TEXT
-  end
-
   def auto_listen_enabled?(message)
     settings_for(message).fetch("auto_listen")
   end
@@ -268,7 +307,7 @@ module Iearumon
   def settings_for(message)
     @settings_mutex.synchronize do
       stored_settings = read_settings.fetch(settings_scope_key(message), {})
-      DEFAULT_SETTINGS.merge(stored_settings)
+      normalize_settings(message, stored_settings)
     end
   end
 
@@ -276,12 +315,23 @@ module Iearumon
     @settings_mutex.synchronize do
       settings = read_settings
       key = settings_scope_key(message)
-      current = DEFAULT_SETTINGS.merge(settings.fetch(key, {}))
-      updated = yield current
+      current = normalize_settings(message, settings.fetch(key, {}))
+      updated = normalize_settings(message, yield(current))
       settings[key] = updated
       write_settings(settings)
       updated
     end
+  end
+
+  def normalize_settings(context, stored_settings)
+    normalized = default_settings_for(context).merge(stored_settings)
+    return normalized unless context.server
+
+    normalized.merge("stats" => DEFAULT_SERVER_STATS.merge(stored_settings.fetch("stats", {})))
+  end
+
+  def default_settings_for(context)
+    context.server ? DEFAULT_SERVER_SETTINGS : DEFAULT_DM_SETTINGS
   end
 
   def read_settings
@@ -305,6 +355,36 @@ module Iearumon
 
   def settings_scope_label(message)
     message.server ? "this server" : "this DM"
+  end
+
+  def dm_transcription_allowed_for?(context)
+    return true if context.server
+
+    settings_for(context).fetch("dm_enabled")
+  end
+
+  def ensure_dm_transcription_allowed!(context)
+    return if dm_transcription_allowed_for?(context)
+
+    raise TranscriptionError, dm_disabled_message
+  end
+
+  def reply_dm_disabled_message(message)
+    reply_with_chunks(message, dm_disabled_message)
+    true
+  end
+
+  def dm_disabled_message
+    "DM transcription is disabled by default. Run `/iearumon dm enabled:true` here first if you want me to transcribe voice notes in DMs."
+  end
+
+  def add_processing_reaction(message)
+    message.react(reaction_emoji_for(message))
+  rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError => e
+    log_warn(
+      "could not add processing reaction",
+      message_log_context(message, reaction: reaction_emoji_for(message), error_class: e.class.name, error: e.message)
+    )
   end
 
   def authorize_settings_change!(event)
@@ -353,7 +433,7 @@ module Iearumon
     AUDIO_FILE_EXTENSIONS.include?(File.extname(filename.to_s).downcase)
   end
 
-  def with_downloaded_attachment(attachment)
+  def with_downloaded_attachment(message, attachment)
     attachment_size = attachment.size.to_i
     if attachment_size.positive? && attachment_size > max_audio_bytes
       raise TranscriptionError, "That voice note is too large to transcribe safely. The current limit is #{byte_limit_label(max_audio_bytes)}."
@@ -363,6 +443,11 @@ module Iearumon
     extension = ".ogg" if extension.empty?
 
     Tempfile.create(["iearumon-voice-note", extension], binmode: true) do |file|
+      log_info(
+        "starting attachment download",
+        message_log_context(message, filename: attachment.filename, expected_bytes: attachment_size.positive? ? attachment_size : nil)
+      )
+
       URI.open(attachment.url, "rb", open_timeout: download_open_timeout, read_timeout: download_read_timeout) do |remote_file|
         bytes_downloaded = 0
 
@@ -374,18 +459,22 @@ module Iearumon
 
           file.write(chunk)
         end
+
+        log_info("finished attachment download", message_log_context(message, downloaded_bytes: bytes_downloaded))
       end
       file.flush
 
       yield file.path
     end
   rescue Net::OpenTimeout, Net::ReadTimeout, Timeout::Error
+    log_warn("attachment download timed out", message_log_context(message, filename: attachment.filename))
     raise TranscriptionError, "Discord took too long to send that voice note. Please try again in a moment."
   rescue OpenURI::HTTPError, SocketError
+    log_warn("attachment download failed", message_log_context(message, filename: attachment.filename))
     raise TranscriptionError, "Discord wouldn't let me download that voice note."
   end
 
-  def transcribe(path)
+  def transcribe(message, path)
     whisper_command = Shellwords.split(ENV.fetch("WHISPER_COMMAND", DEFAULT_WHISPER_COMMAND))
     raise ConfigurationError, "Set WHISPER_COMMAND to a local Whisper CLI command." if whisper_command.empty?
 
@@ -394,6 +483,16 @@ module Iearumon
     raise ConfigurationError, "Couldn't find `ffmpeg` in PATH." unless executable_available?("ffmpeg")
 
     Dir.mktmpdir("iearumon-whisper") do |output_dir|
+      log_info(
+        "starting transcription",
+        message_log_context(
+          message,
+          whisper_command: whisper_command.join(" "),
+          model: ENV.fetch("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
+          language: ENV["WHISPER_LANGUAGE"]&.strip
+        )
+      )
+
       stdout, stderr, status = capture_command_with_timeout(
         transcription_timeout,
         *whisper_command,
@@ -409,10 +508,55 @@ module Iearumon
 
       transcript_path = File.join(output_dir, "#{File.basename(path, File.extname(path))}.txt")
       transcript = File.exist?(transcript_path) ? File.read(transcript_path).strip : ""
-      return transcript if status.success? && !transcript.empty?
+      if status.success? && !transcript.empty?
+        log_info(
+          "finished transcription",
+          message_log_context(
+            message,
+            transcript_characters: transcript.length,
+            stdout_bytes: stdout.to_s.bytesize,
+            stderr_bytes: stderr.to_s.bytesize
+          )
+        )
+        return transcript
+      end
+
+      log_warn(
+        "transcription produced no output",
+        message_log_context(
+          message,
+          exit_status: status.exitstatus,
+          stdout_preview: truncated_log_output(stdout),
+          stderr_preview: truncated_log_output(stderr)
+        )
+      )
 
       raise TranscriptionError, "Whisper couldn't produce a transcription for that voice note."
     end
+  end
+
+  def audio_duration_seconds(path, attachment)
+    attachment_duration = attachment.duration_seconds.to_f
+    return attachment_duration.round if attachment_duration.positive?
+
+    return 0 unless executable_available?("ffprobe")
+
+    stdout, stderr, status = capture_command_with_timeout(
+      30,
+      "ffprobe",
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      path
+    )
+    duration = stdout.to_f
+    return duration.round if status.success? && duration.positive?
+
+    log_warn("ffprobe could not determine audio duration", path: path, stderr_preview: truncated_log_output(stderr))
+    0
+  rescue TranscriptionError => e
+    log_warn("audio duration lookup timed out", path: path, error: e.message)
+    0
   end
 
   def language_args
@@ -481,6 +625,7 @@ module Iearumon
       end
 
       @transcription_workers_started = true
+      log_info("started transcription workers", worker_count: transcription_worker_count, queue_limit: transcription_queue_limit)
     end
   end
 
@@ -493,9 +638,19 @@ module Iearumon
         handle_voice_note(message)
         completed = true
       rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
+        log_warn("voice note transcription failed", message_log_context(message, error_class: e.class.name, error: e.message))
         bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
         reply_with_chunks(message, user_transcription_error_message(e))
       rescue StandardError => e
+        log_warn(
+          "voice note transcription failed unexpectedly",
+          message_log_context(
+            message,
+            error_class: e.class.name,
+            error: e.message,
+            backtrace_preview: truncated_log_output(Array(e.backtrace).first(5).join(" | "))
+          )
+        )
         bot.debug("voice note transcription failed unexpectedly: #{e.class}: #{e.message}")
         reply_with_chunks(message, "I couldn't transcribe that voice note because an internal error occurred.")
       ensure
@@ -547,6 +702,123 @@ module Iearumon
     formatted = megabytes.round(1)
     formatted = formatted.to_i if formatted == formatted.to_i
     "#{formatted} MiB"
+  end
+
+  def record_successful_transcription(message, duration_seconds)
+    return unless message.server
+
+    updated_settings = update_settings_for(message) do |current|
+      stats = current.fetch("stats")
+      current.merge(
+        "stats" => stats.merge(
+          "total_transcriptions" => stats.fetch("total_transcriptions").to_i + 1,
+          "seconds_transcribed" => stats.fetch("seconds_transcribed").to_i + duration_seconds.to_i
+        )
+      )
+    end
+
+    stats = updated_settings.fetch("stats")
+    log_info(
+      "updated server transcription stats",
+      message_log_context(
+        message,
+        duration_seconds: duration_seconds.to_i,
+        total_transcriptions: stats.fetch("total_transcriptions"),
+        seconds_transcribed: stats.fetch("seconds_transcribed")
+      )
+    )
+  end
+
+  def populate_status_embed(embed, context)
+    settings = settings_for(context)
+    embed.title = context.server ? "iearumon overview" : "iearumon DM overview"
+    embed.description = context.server ? "Voice note transcription for **#{context.server.name}**." : "Voice note transcription settings for this DM."
+    embed.color = context.server ? STATS_EMBED_COLOR : DM_EMBED_COLOR
+    embed.timestamp = Time.now
+
+    embed.add_field(name: "Listening", value: enabled_label(settings.fetch("auto_listen")), inline: true)
+    embed.add_field(name: "Trigger emoji", value: settings.fetch("reaction_emoji"), inline: true)
+
+    if context.server
+      stats = settings.fetch("stats")
+      embed.add_field(name: "Transcriptions", value: "**#{format_integer(stats.fetch("total_transcriptions"))}** total", inline: true)
+      embed.add_field(
+        name: "Audio processed",
+        value: "**#{duration_summary(stats.fetch("seconds_transcribed"))}**\n#{format_integer(stats.fetch("seconds_transcribed"))} sec",
+        inline: true
+      )
+      embed.add_field(
+        name: "How it works",
+        value: "New voice notes are transcribed automatically when listening is enabled.\nYou can always react with #{settings.fetch("reaction_emoji")} to trigger a manual transcription.",
+        inline: false
+      )
+    else
+      embed.add_field(name: "DM transcription", value: enabled_label(settings.fetch("dm_enabled")), inline: true)
+      embed.add_field(
+        name: "How it works",
+        value: settings.fetch("dm_enabled") ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes." : "Run `/iearumon dm enabled:true` here first if you want DM voice note transcription.",
+        inline: false
+      )
+    end
+
+    embed.footer = Discordrb::Webhooks::EmbedFooter.new(text: context.server ? "Server overview" : "DM overview")
+  end
+
+  def enabled_label(enabled)
+    enabled ? "Enabled" : "Disabled"
+  end
+
+  def duration_summary(total_seconds)
+    seconds = total_seconds.to_i
+    return "0s total" if seconds <= 0
+
+    parts = []
+    hours = seconds / 3600
+    minutes = (seconds % 3600) / 60
+    remaining_seconds = seconds % 60
+    parts << "#{hours}h" if hours.positive?
+    parts << "#{minutes}m" if minutes.positive?
+    parts << "#{remaining_seconds}s" if remaining_seconds.positive? || parts.empty?
+    parts.join(" ")
+  end
+
+  def format_integer(number)
+    number.to_i.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+
+  def truncated_log_output(output, max_length = 160)
+    text = output.to_s.strip
+    return nil if text.empty?
+
+    text.length > max_length ? "#{text[0, max_length]}..." : text
+  end
+
+  def message_log_context(message, extra = {})
+    {
+      scope: settings_scope_key(message),
+      server_id: message.server&.id,
+      channel_id: message.channel.id,
+      message_id: message.id,
+      author_id: message.author&.id
+    }.merge(extra).compact
+  end
+
+  def log_info(message, context = {})
+    log_runtime("INFO", message, context)
+  end
+
+  def log_warn(message, context = {})
+    log_runtime("WARN", message, context)
+  end
+
+  def log_runtime(level, message, context = {})
+    fields = context.map { |key, value| "#{key}=#{format_log_value(value)}" }.join(" ")
+    $stdout.puts("[#{Time.now.utc.iso8601}] #{level} #{message}#{fields.empty? ? "" : " #{fields}"}")
+    $stdout.flush
+  end
+
+  def format_log_value(value)
+    value.is_a?(String) ? value.inspect : value
   end
 
   def user_configuration_error_message(context)
