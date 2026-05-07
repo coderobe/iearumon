@@ -43,6 +43,7 @@ Discord bot that transcribes Discord voice notes with a local Whisper CLI.
 ## Behavior
 
 - Automatically transcribes new `voice-message.ogg` voice-note attachments by default
+- Longer transcriptions stream into a single in-progress reply that is edited conservatively until the final text is ready
 - DMs are controlled globally with `IEARUMON_DM_ENABLED` and are disabled by default
 - Manual transcription is triggered by reacting with `👂`
 - Reacting with `?`, `❓`, or `❔` on one of the bot's transcription replies retries that voice note with the next larger Whisper model, up to `IEARUMON_MAX_WHISPER_MODEL`
@@ -61,6 +62,8 @@ IEARUMON_TRANSCRIPTION_TIMEOUT=1800
 IEARUMON_MAX_AUDIO_BYTES=67108864
 IEARUMON_DOWNLOAD_OPEN_TIMEOUT=15
 IEARUMON_DOWNLOAD_READ_TIMEOUT=300
+IEARUMON_PROGRESS_PREVIEW_WORDS=5
+IEARUMON_PROGRESS_UPDATE_INTERVAL=5
 ```
 
 ## systemd

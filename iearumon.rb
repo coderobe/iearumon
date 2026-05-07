@@ -32,6 +32,8 @@ module Iearumon
   DEFAULT_TRANSCRIPTION_WORKERS = 2
   DEFAULT_TRANSCRIPTION_QUEUE_LIMIT = 24
   DEFAULT_DM_ENABLED = false
+  DEFAULT_PROGRESS_PREVIEW_WORDS = 5
+  DEFAULT_PROGRESS_UPDATE_INTERVAL = 5
   EAR_EMOJI = "👂"
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
@@ -39,6 +41,7 @@ module Iearumon
   STATS_EMBED_COLOR = 0x5865F2
   DM_EMBED_COLOR = 0xFEE75C
   VOICE_NOTE_FILENAME = "voice-message.ogg"
+  STREAMING_TRANSCRIPTION_STATUS = " *[...]*\n-# this transcription is still being processed"
   DEFAULT_SERVER_STATS = {
     "total_transcriptions" => 0,
     "seconds_transcribed" => 0
@@ -79,6 +82,168 @@ module Iearumon
   @worker_mutex = Mutex.new
   @messages_in_progress = Set.new
   @recent_transcriptions = {}
+
+  class DisplayedTranscriptionError < TranscriptionError; end
+
+  class StreamingTranscriptionReply
+    def initialize(reply_to_message, preview_word_count:, min_edit_interval:)
+      @reply_to_message = reply_to_message
+      @preview_word_count = preview_word_count
+      @min_edit_interval = min_edit_interval
+      @mutex = Mutex.new
+      @partial_segments = []
+      @placeholder_message = nil
+      @last_rendered_content = nil
+      @last_update_at = nil
+      @pending_rendered_content = nil
+      @flush_thread = nil
+      @closed = false
+    end
+
+    def append_segment(segment_text)
+      normalized_segment = normalize_segment_text(segment_text)
+      return if normalized_segment.empty?
+
+      @mutex.synchronize do
+        return if @closed
+
+        @partial_segments << normalized_segment
+        partial_text = @partial_segments.join(" ").strip
+        return unless enough_words_for_preview?(partial_text)
+
+        rendered_content = render_progress_content(partial_text)
+        return if rendered_content == @last_rendered_content
+
+        now = Time.now
+        if @placeholder_message
+          if @last_update_at && (now - @last_update_at) < @min_edit_interval
+            @pending_rendered_content = rendered_content
+            ensure_flush_thread_running
+            return
+          end
+
+          update_placeholder(rendered_content)
+        else
+          create_placeholder(rendered_content)
+        end
+
+        @last_rendered_content = rendered_content
+        @last_update_at = now
+      end
+    rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError => e
+      Iearumon.log_warn(
+        "could not update streaming transcription reply",
+        Iearumon.message_log_context(
+          @reply_to_message,
+          error_class: e.class.name,
+          error: e.message
+        )
+      )
+    end
+
+    def complete(final_transcript)
+      transcript = final_transcript.to_s
+      @mutex.synchronize do
+        @closed = true
+        @pending_rendered_content = nil
+      end
+
+      return Iearumon.reply_with_chunks(@reply_to_message, transcript) unless @placeholder_message
+
+      chunks = Discordrb.split_message(transcript)
+      return [] if chunks.empty?
+
+      begin
+        @placeholder_message.edit(chunks.shift)
+      rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError
+        return Iearumon.reply_with_chunks(@reply_to_message, transcript)
+      end
+
+      [@placeholder_message, *chunks.map { |chunk| @reply_to_message.reply!(chunk, mention_user: false) }]
+    end
+
+    def display_failure(content)
+      @mutex.synchronize do
+        @closed = true
+        @pending_rendered_content = nil
+        return false unless @placeholder_message
+
+        @placeholder_message.edit(content)
+      end
+
+      true
+    rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError => e
+      Iearumon.log_warn(
+        "could not replace streaming transcription reply with failure",
+        Iearumon.message_log_context(
+          @reply_to_message,
+          error_class: e.class.name,
+          error: e.message
+        )
+      )
+      false
+    end
+
+    private
+
+    def enough_words_for_preview?(text)
+      text.split(/\s+/).length >= @preview_word_count
+    end
+
+    def normalize_segment_text(text)
+      text.to_s.gsub(/\s+/, " ").strip
+    end
+
+    def render_progress_content(text)
+      max_preview_length = 2000 - Iearumon::STREAMING_TRANSCRIPTION_STATUS.length
+      preview = text[0, max_preview_length].to_s.rstrip
+      "#{preview}#{Iearumon::STREAMING_TRANSCRIPTION_STATUS}"
+    end
+
+    def ensure_flush_thread_running
+      return if @flush_thread&.alive?
+
+      @flush_thread = Thread.new do
+        loop do
+          sleep_duration = nil
+          should_stop = false
+
+          @mutex.synchronize do
+            if @closed || @pending_rendered_content.nil?
+              should_stop = true
+            else
+              sleep_duration = [@min_edit_interval - (Time.now - @last_update_at), 0].max
+            end
+          end
+
+          break if should_stop
+          sleep(sleep_duration) if sleep_duration.positive?
+
+          should_stop = false
+          @mutex.synchronize do
+            if @closed || @pending_rendered_content.nil?
+              should_stop = true
+            elsif !(@last_update_at && (Time.now - @last_update_at) < @min_edit_interval)
+              update_placeholder(@pending_rendered_content)
+              @pending_rendered_content = nil
+            end
+          end
+
+          break if should_stop
+        end
+      end
+    end
+
+    def create_placeholder(content)
+      @placeholder_message = @reply_to_message.reply!(content, mention_user: false)
+    end
+
+    def update_placeholder(content)
+      @placeholder_message.edit(content)
+      @last_rendered_content = content
+      @last_update_at = Time.now
+    end
+  end
 
   module_function
 
@@ -151,6 +316,11 @@ module Iearumon
     attachment = voice_note_attachment(source_message)
     raise TranscriptionError, "No voice note attachment was found." unless attachment
     ensure_dm_transcription_allowed!(source_message)
+    streaming_reply = StreamingTranscriptionReply.new(
+      reply_to_message,
+      preview_word_count: progress_preview_words,
+      min_edit_interval: progress_update_interval
+    )
 
     add_processing_reaction(reply_to_message)
 
@@ -161,7 +331,9 @@ module Iearumon
 
     transcript = with_downloaded_attachment(source_message, attachment) do |path|
       duration_seconds = audio_duration_seconds(path, attachment)
-      transcript = transcribe(source_message, path, model: model)
+      transcript = transcribe(source_message, path, model: model) do |partial_text|
+        streaming_reply.append_segment(partial_text)
+      end
       record_successful_transcription(source_message, duration_seconds)
       transcript
     end
@@ -170,8 +342,18 @@ module Iearumon
       "completed voice note processing",
       message_log_context(source_message, reply_to_message_id: reply_to_message.id, model: model, transcript_characters: transcript.length)
     )
-    reply_messages = reply_with_chunks(reply_to_message, transcript.to_s)
+    reply_messages = streaming_reply.complete(transcript)
     record_transcription_responses(reply_messages, source_message: source_message, model: model)
+  rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
+    raise DisplayedTranscriptionError, e.message if streaming_reply&.display_failure(user_transcription_error_message(e))
+
+    raise
+  rescue StandardError => e
+    if streaming_reply&.display_failure("-# i couldn't transcribe that voice note because an internal error occurred.")
+      raise DisplayedTranscriptionError, e.message
+    end
+
+    raise
   end
 
   def enqueue_transcription(bot, request)
@@ -624,9 +806,14 @@ module Iearumon
         "--task", "transcribe",
         "--output_format", "txt",
         "--output_dir", output_dir,
-        "--verbose", "False",
+        "--verbose", "True",
         "--fp16", "False",
-        *language_args
+        *language_args,
+        env: { "PYTHONUNBUFFERED" => "1" },
+        stdout_line_callback: proc do |line|
+          partial_text = whisper_progress_text(line)
+          yield partial_text if partial_text && block_given?
+        end
       )
 
       transcript_path = File.join(output_dir, "#{File.basename(path, File.extname(path))}.txt")
@@ -844,7 +1031,7 @@ module Iearumon
           message_log_context(request.fetch(:source_message), error_class: e.class.name, error: e.message, model: request.fetch(:model))
         )
         bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
-        reply_with_chunks(request.fetch(:reply_to_message), user_transcription_error_message(e))
+        reply_with_chunks(request.fetch(:reply_to_message), user_transcription_error_message(e)) unless e.is_a?(DisplayedTranscriptionError)
       rescue StandardError => e
         log_warn(
           "voice note transcription failed unexpectedly",
@@ -864,11 +1051,16 @@ module Iearumon
     end
   end
 
-  def capture_command_with_timeout(timeout_seconds, *command)
-    Open3.popen3(*command) do |stdin, stdout, stderr, wait_thread|
+  def capture_command_with_timeout(timeout_seconds, *command, env: {}, stdout_line_callback: nil)
+    Open3.popen3(env, *command) do |stdin, stdout, stderr, wait_thread|
       stdin.close
 
-      stdout_reader = Thread.new { stdout.read }
+      stdout_reader = Thread.new do
+        stdout.each_line.with_object(+"") do |line, buffer|
+          buffer << line
+          stdout_line_callback&.call(line)
+        end
+      end
       stderr_reader = Thread.new { stderr.read }
 
       unless wait_thread.join(timeout_seconds)
@@ -1038,10 +1230,26 @@ module Iearumon
     "-# i couldn't transcribe that voice note."
   end
 
+  def whisper_progress_text(line)
+    match = line.to_s.match(/^\[(?:\d{2}:)?\d{2}:\d{2}\.\d{3} --> (?:\d{2}:)?\d{2}:\d{2}\.\d{3}\]\s*(.+?)\s*$/)
+    return nil unless match
+
+    text = match[1].to_s.gsub(/\s+/, " ").strip
+    text.empty? ? nil : text
+  end
+
   def reply_with_chunks(message, content)
     Discordrb.split_message(content).map do |chunk|
       message.reply!(chunk, mention_user: false)
     end
+  end
+
+  def progress_preview_words
+    @progress_preview_words ||= positive_integer_env("IEARUMON_PROGRESS_PREVIEW_WORDS", DEFAULT_PROGRESS_PREVIEW_WORDS)
+  end
+
+  def progress_update_interval
+    @progress_update_interval ||= positive_integer_env("IEARUMON_PROGRESS_UPDATE_INTERVAL", DEFAULT_PROGRESS_UPDATE_INTERVAL)
   end
 
   def transcription_request_key(request)
