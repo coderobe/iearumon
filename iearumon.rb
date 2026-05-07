@@ -22,6 +22,7 @@ module Iearumon
   MESSAGE_CONTENT_INTENT = 1 << 15
   DEFAULT_WHISPER_COMMAND = "whisper"
   DEFAULT_WHISPER_MODEL = "base"
+  DEFAULT_MAX_WHISPER_MODEL = "large"
 #  DEFAULT_WHISPER_MODEL = "small"
 #  DEFAULT_WHISPER_MODEL = "medium"
   DEFAULT_DOWNLOAD_OPEN_TIMEOUT = 15
@@ -51,8 +52,29 @@ module Iearumon
     "auto_listen" => true,
     "reaction_emoji" => EAR_EMOJI
   }.freeze
+  QUESTION_MARK_REACTIONS = Set["?", "❓", "❔"].freeze
+  WHISPER_MODELS_BY_RANK = {
+    0 => "tiny",
+    1 => "base",
+    2 => "small",
+    3 => "medium",
+    4 => "large"
+  }.freeze
+  WHISPER_MODEL_RANKS = {
+    "tiny" => 0,
+    "base" => 1,
+    "small" => 2,
+    "medium" => 3,
+    "large" => 4,
+    "large-v1" => 4,
+    "large-v2" => 4,
+    "large-v3" => 4,
+    "turbo" => 4
+  }.freeze
+  TRANSCRIPTION_RECORDS_PATH = File.expand_path("iearumon_transcriptions.json", __dir__)
 
   @settings_mutex = Mutex.new
+  @transcription_records_mutex = Mutex.new
   @transcription_mutex = Mutex.new
   @worker_mutex = Mutex.new
   @messages_in_progress = Set.new
@@ -83,7 +105,7 @@ module Iearumon
         next if dm_ignored?(event.message)
         next unless auto_listen_enabled?(event.message)
 
-        enqueue_transcription(bot, event.message)
+        enqueue_transcription(bot, transcription_request_for(event.message))
       rescue ConfigurationError => e
         bot.debug("message handling failed: #{e.class}: #{e.message}")
         reply_with_chunks(event.message, user_configuration_error_message(event))
@@ -93,11 +115,12 @@ module Iearumon
     bot.reaction_add do |event|
       begin
         next if bot_user?(event.user)
+        next if dm_ignored?(event.message)
+        next if handle_retry_reaction(bot, event.message, event.emoji)
         next unless voice_note_message?(event.message)
         next unless reaction_matches?(event.emoji, reaction_emoji_for(event.message))
-        next if dm_ignored?(event.message)
 
-        enqueue_transcription(bot, event.message)
+        enqueue_transcription(bot, transcription_request_for(event.message))
       rescue ConfigurationError => e
         bot.debug("reaction handling failed: #{e.class}: #{e.message}")
         reply_with_chunks(event.message, user_configuration_error_message(event))
@@ -121,35 +144,65 @@ module Iearumon
       MESSAGE_CONTENT_INTENT
   end
 
-  def handle_voice_note(message)
-    attachment = voice_note_attachment(message)
+  def handle_voice_note(request)
+    source_message = request.fetch(:source_message)
+    reply_to_message = request.fetch(:reply_to_message)
+    model = request.fetch(:model)
+    attachment = voice_note_attachment(source_message)
     raise TranscriptionError, "No voice note attachment was found." unless attachment
-    ensure_dm_transcription_allowed!(message)
+    ensure_dm_transcription_allowed!(source_message)
 
-    add_processing_reaction(message)
+    add_processing_reaction(reply_to_message)
 
-    log_info("starting voice note processing", message_log_context(message, filename: attachment.filename))
+    log_info(
+      "starting voice note processing",
+      message_log_context(source_message, filename: attachment.filename, reply_to_message_id: reply_to_message.id, model: model)
+    )
 
-    transcript = with_downloaded_attachment(message, attachment) do |path|
+    transcript = with_downloaded_attachment(source_message, attachment) do |path|
       duration_seconds = audio_duration_seconds(path, attachment)
-      transcript = transcribe(message, path)
-      record_successful_transcription(message, duration_seconds)
+      transcript = transcribe(source_message, path, model: model)
+      record_successful_transcription(source_message, duration_seconds)
       transcript
     end
 
-    log_info("completed voice note processing", message_log_context(message, transcript_characters: transcript.length))
-    reply_with_chunks(message, transcript.to_s)
+    log_info(
+      "completed voice note processing",
+      message_log_context(source_message, reply_to_message_id: reply_to_message.id, model: model, transcript_characters: transcript.length)
+    )
+    reply_messages = reply_with_chunks(reply_to_message, transcript.to_s)
+    record_transcription_responses(reply_messages, source_message: source_message, model: model)
   end
 
-  def enqueue_transcription(bot, message)
-    return unless reserve_transcription(message.id)
+  def enqueue_transcription(bot, request)
+    reservation_key = reserve_transcription_request(request)
+    return false unless reservation_key
+
+    enqueue_reserved_transcription(bot, request, reservation_key)
+  end
+
+  def reserve_transcription_request(request)
+    reservation_key = transcription_request_key(request)
+    return nil unless reserve_transcription(reservation_key)
+
+    reservation_key
+  end
+
+  def enqueue_reserved_transcription(bot, request, reservation_key)
+    return false if reservation_key.nil?
 
     ensure_transcription_workers_running(bot)
-    transcription_queue.push(message, true)
-    log_info("queued voice note transcription", message_log_context(message, queue_depth: transcription_queue.length))
-  rescue ThreadError
-    clear_transcription_reservation(message.id)
-    reply_with_chunks(message, "I'm already working through a full transcription backlog right now. Please try that voice note again in a little while.")
+    transcription_queue.push(request)
+    log_info(
+      "queued voice note transcription",
+      message_log_context(
+        request.fetch(:source_message),
+        queue_depth: transcription_queue.length,
+        reply_to_message_id: request.fetch(:reply_to_message).id,
+        model: request.fetch(:model)
+      )
+    )
+    true
   end
 
   def register_slash_commands(bot)
@@ -275,6 +328,14 @@ module Iearumon
     settings_for(message).fetch("reaction_emoji")
   end
 
+  def transcription_request_for(source_message, reply_to_message: source_message, model: default_whisper_model)
+    {
+      source_message: source_message,
+      reply_to_message: reply_to_message,
+      model: normalized_whisper_model_value(model)
+    }
+  end
+
   def settings_for(message)
     @settings_mutex.synchronize do
       stored_settings = read_settings.fetch(settings_scope_key(message), {})
@@ -316,6 +377,60 @@ module Iearumon
   def write_settings(settings)
     File.write("#{SETTINGS_PATH}.tmp", "#{JSON.pretty_generate(settings)}\n")
     File.rename("#{SETTINGS_PATH}.tmp", SETTINGS_PATH)
+  end
+
+  def read_transcription_records
+    return {} unless File.exist?(TRANSCRIPTION_RECORDS_PATH)
+
+    JSON.parse(File.read(TRANSCRIPTION_RECORDS_PATH))
+  rescue JSON::ParserError => e
+    raise ConfigurationError, "The transcription records file at #{TRANSCRIPTION_RECORDS_PATH} is invalid JSON: #{e.message}"
+  end
+
+  def write_transcription_records(records)
+    File.write("#{TRANSCRIPTION_RECORDS_PATH}.tmp", "#{JSON.pretty_generate(records)}\n")
+    File.rename("#{TRANSCRIPTION_RECORDS_PATH}.tmp", TRANSCRIPTION_RECORDS_PATH)
+  end
+
+  def transcription_record_for(message_id)
+    @transcription_records_mutex.synchronize do
+      read_transcription_records[message_id.to_s]
+    end
+  end
+
+  def claim_retry_reaction_for(message_id)
+    @transcription_records_mutex.synchronize do
+      records = read_transcription_records
+      record_key = message_id.to_s
+      record = records[record_key]
+      return [:missing, nil] unless record
+      return [:already_handled, record] if record["retry_requested_at"]
+
+      updated_record = record.merge("retry_requested_at" => Time.now.utc.iso8601)
+      records[record_key] = updated_record
+      write_transcription_records(records)
+      [:claimed, updated_record]
+    end
+  end
+
+  def record_transcription_responses(reply_messages, source_message:, model:)
+    return if reply_messages.empty?
+
+    @transcription_records_mutex.synchronize do
+      records = read_transcription_records
+      created_at = Time.now.utc.iso8601
+
+      reply_messages.each do |reply_message|
+        records[reply_message.id.to_s] = {
+          "source_message_id" => source_message.id,
+          "source_channel_id" => source_message.channel.id,
+          "model" => normalized_whisper_model_value(model),
+          "created_at" => created_at
+        }
+      end
+
+      write_transcription_records(records)
+    end
   end
 
   def settings_scope_key(message)
@@ -363,15 +478,66 @@ module Iearumon
     return unless event.server
     return if event.user.respond_to?(:can_manage_server?) && event.user.can_manage_server?
 
-    raise AuthorizationError, "You need the Manage Server permission to change iearumon settings for this server."
+    raise AuthorizationError, "-# you need the Manage Server permission to change iearumon settings for this server."
   end
 
   def reaction_matches?(emoji, configured_emoji)
     reaction_string(emoji) == configured_emoji
   end
 
+  def retry_reaction?(emoji)
+    QUESTION_MARK_REACTIONS.include?(reaction_string(emoji))
+  end
+
   def reaction_string(emoji)
     emoji.respond_to?(:to_reaction) ? emoji.to_reaction.to_s : emoji.to_s
+  end
+
+  def handle_retry_reaction(bot, reacted_message, emoji)
+    return false unless retry_reaction?(emoji)
+
+    retry_claim, retry_record = claim_retry_reaction_for(reacted_message.id)
+    return false if retry_claim == :missing
+    return true if retry_claim == :already_handled
+
+    current_model = current_retry_model_for(retry_record)
+    return true unless current_model
+
+    next_model = next_retry_whisper_model(current_model)
+    unless next_model
+      reply_with_chunks(reacted_message, "-# that's all i've got, you're on your own now")
+      return true
+    end
+
+    source_message = resolve_retry_source_message(bot, reacted_message, retry_record)
+    unless source_message
+      reply_with_chunks(reacted_message, "-# transcription requested but i can't find the original voice note anymore")
+      return true
+    end
+
+    request = transcription_request_for(source_message, reply_to_message: reacted_message, model: next_model)
+    reservation_key = reserve_transcription_request(request)
+    return true unless reservation_key
+
+    reply_with_chunks(reacted_message, "-# got ? react. hold on, trying harder.")
+    enqueue_reserved_transcription(bot, request, reservation_key)
+    true
+  end
+
+  def current_retry_model_for(retry_record)
+    reacted_model = normalized_whisper_model_value(retry_record.fetch("model"))
+    highest_model = highest_transcription_model_for_source(retry_record.fetch("source_message_id"))
+    return reacted_model unless highest_model
+    return nil if whisper_model_rank(highest_model) > whisper_model_rank(reacted_model)
+
+    reacted_model
+  end
+
+  def resolve_retry_source_message(bot, reacted_message, retry_record)
+    source_channel = bot.channel(retry_record.fetch("source_channel_id").to_i) || reacted_message.channel
+    source_channel&.message(retry_record.fetch("source_message_id").to_i)
+  rescue Discordrb::Errors::NoPermission, Discordrb::Errors::UnknownMessage
+    nil
   end
 
   def bot_user?(user)
@@ -393,7 +559,7 @@ module Iearumon
   def with_downloaded_attachment(message, attachment)
     attachment_size = attachment.size.to_i
     if attachment_size.positive? && attachment_size > max_audio_bytes
-      raise TranscriptionError, "That voice note is too large to transcribe safely. The current limit is #{byte_limit_label(max_audio_bytes)}."
+      raise TranscriptionError, "-# that voice note is too large to transcribe safely. the current limit is #{byte_limit_label(max_audio_bytes)}."
     end
 
     extension = File.extname(attachment.filename)
@@ -411,7 +577,7 @@ module Iearumon
         while (chunk = remote_file.read(64 * 1024))
           bytes_downloaded += chunk.bytesize
           if bytes_downloaded > max_audio_bytes
-            raise TranscriptionError, "That voice note is too large to transcribe safely. The current limit is #{byte_limit_label(max_audio_bytes)}."
+            raise TranscriptionError, "-# that voice note is too large to transcribe safely. the current limit is #{byte_limit_label(max_audio_bytes)}."
           end
 
           file.write(chunk)
@@ -425,13 +591,13 @@ module Iearumon
     end
   rescue Net::OpenTimeout, Net::ReadTimeout, Timeout::Error
     log_warn("attachment download timed out", message_log_context(message, filename: attachment.filename))
-    raise TranscriptionError, "Discord took too long to send that voice note. Please try again in a moment."
+    raise TranscriptionError, "-# discord took too long to send me that voice note. try again in a moment."
   rescue OpenURI::HTTPError, SocketError
     log_warn("attachment download failed", message_log_context(message, filename: attachment.filename))
-    raise TranscriptionError, "Discord wouldn't let me download that voice note."
+    raise TranscriptionError, "-# discord wouldn't let me download that voice note."
   end
 
-  def transcribe(message, path)
+  def transcribe(message, path, model:)
     whisper_command = Shellwords.split(ENV.fetch("WHISPER_COMMAND", DEFAULT_WHISPER_COMMAND))
     raise ConfigurationError, "Set WHISPER_COMMAND to a local Whisper CLI command." if whisper_command.empty?
 
@@ -445,7 +611,7 @@ module Iearumon
         message_log_context(
           message,
           whisper_command: whisper_command.join(" "),
-          model: ENV.fetch("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
+          model: model,
           language: ENV["WHISPER_LANGUAGE"]&.strip
         )
       )
@@ -454,7 +620,7 @@ module Iearumon
         transcription_timeout,
         *whisper_command,
         path,
-        "--model", ENV.fetch("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
+        "--model", model,
         "--task", "transcribe",
         "--output_format", "txt",
         "--output_dir", output_dir,
@@ -488,7 +654,7 @@ module Iearumon
         )
       )
 
-      raise TranscriptionError, "Whisper couldn't produce a transcription for that voice note."
+      raise TranscriptionError, "-# failed transcription: no idea what you said."
     end
   end
 
@@ -561,6 +727,69 @@ module Iearumon
     @download_open_timeout ||= positive_integer_env("IEARUMON_DOWNLOAD_OPEN_TIMEOUT", DEFAULT_DOWNLOAD_OPEN_TIMEOUT)
   end
 
+  def default_whisper_model
+    @default_whisper_model ||= begin
+      model = ENV.fetch("WHISPER_MODEL", DEFAULT_WHISPER_MODEL).to_s.strip
+      model.empty? ? DEFAULT_WHISPER_MODEL : model
+    end
+  end
+
+  def normalized_whisper_model_value(model)
+    value = model.to_s.strip.downcase
+    value.empty? ? DEFAULT_WHISPER_MODEL : value
+  end
+
+  def whisper_model_rank(model)
+    WHISPER_MODEL_RANKS[normalized_whisper_model_value(model)]
+  end
+
+  def highest_transcription_model_for_source(source_message_id)
+    source_id = source_message_id.to_s
+    completed_models = @transcription_records_mutex.synchronize do
+      read_transcription_records.each_value.filter_map do |record|
+        next unless record["source_message_id"].to_s == source_id
+
+        normalized_whisper_model_value(record["model"])
+      end
+    end
+
+    in_progress_models = @transcription_mutex.synchronize do
+      prune_recent_transcriptions!
+      (@messages_in_progress.to_a + @recent_transcriptions.keys).filter_map do |reservation_key|
+        reserved_source_id, reserved_model = reservation_key.to_s.split(":", 2)
+        next unless reserved_source_id == source_id
+
+        normalized_whisper_model_value(reserved_model)
+      end
+    end
+
+    (completed_models + in_progress_models).max_by { |model| whisper_model_rank(model) || -1 }
+  end
+
+  def max_retry_whisper_model
+    @max_retry_whisper_model ||= begin
+      configured_model = ENV.fetch("IEARUMON_MAX_WHISPER_MODEL", DEFAULT_MAX_WHISPER_MODEL).to_s.strip
+      configured_model = DEFAULT_MAX_WHISPER_MODEL if configured_model.empty?
+      rank = whisper_model_rank(configured_model)
+      unless rank
+        raise ConfigurationError,
+              "IEARUMON_MAX_WHISPER_MODEL must be one of tiny, base, small, medium, large, large-v1, large-v2, large-v3, or turbo."
+      end
+
+      WHISPER_MODELS_BY_RANK.fetch(rank)
+    end
+  end
+
+  def next_retry_whisper_model(current_model)
+    current_rank = whisper_model_rank(current_model)
+    return nil unless current_rank
+
+    next_rank = current_rank + 1
+    return nil if next_rank > whisper_model_rank(max_retry_whisper_model)
+
+    WHISPER_MODELS_BY_RANK[next_rank]
+  end
+
   def download_read_timeout
     @download_read_timeout ||= positive_integer_env("IEARUMON_DOWNLOAD_READ_TIMEOUT", DEFAULT_DOWNLOAD_READ_TIMEOUT)
   end
@@ -602,30 +831,35 @@ module Iearumon
 
   def transcription_worker_loop(bot)
     loop do
-      message = transcription_queue.pop
+      request = transcription_queue.pop
       completed = false
+      reservation_key = transcription_request_key(request)
 
       begin
-        handle_voice_note(message)
+        handle_voice_note(request)
         completed = true
       rescue ConfigurationError, TranscriptionError, OpenURI::HTTPError, SocketError => e
-        log_warn("voice note transcription failed", message_log_context(message, error_class: e.class.name, error: e.message))
+        log_warn(
+          "voice note transcription failed",
+          message_log_context(request.fetch(:source_message), error_class: e.class.name, error: e.message, model: request.fetch(:model))
+        )
         bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
-        reply_with_chunks(message, user_transcription_error_message(e))
+        reply_with_chunks(request.fetch(:reply_to_message), user_transcription_error_message(e))
       rescue StandardError => e
         log_warn(
           "voice note transcription failed unexpectedly",
           message_log_context(
-            message,
+            request.fetch(:source_message),
             error_class: e.class.name,
             error: e.message,
+            model: request.fetch(:model),
             backtrace_preview: truncated_log_output(Array(e.backtrace).first(5).join(" | "))
           )
         )
         bot.debug("voice note transcription failed unexpectedly: #{e.class}: #{e.message}")
-        reply_with_chunks(message, "I couldn't transcribe that voice note because an internal error occurred.")
+        reply_with_chunks(request.fetch(:reply_to_message), "-# i couldn't transcribe that voice note because an internal error occurred.")
       ensure
-        completed ? mark_transcription_complete(message.id) : clear_transcription_reservation(message.id)
+        completed ? mark_transcription_complete(reservation_key) : clear_transcription_reservation(reservation_key)
       end
     end
   end
@@ -639,7 +873,7 @@ module Iearumon
 
       unless wait_thread.join(timeout_seconds)
         terminate_process(wait_thread)
-        raise TranscriptionError, "Transcription took longer than #{duration_label(timeout_seconds)}. Please try again later."
+        raise TranscriptionError, "-# transcription took longer than #{duration_label(timeout_seconds)}. try again later."
       end
 
       [stdout_reader.value, stderr_reader.value, wait_thread.value]
@@ -801,13 +1035,17 @@ module Iearumon
   def user_transcription_error_message(error)
     return error.message if error.is_a?(TranscriptionError)
 
-    "I couldn't transcribe that voice note."
+    "-# i couldn't transcribe that voice note."
   end
 
   def reply_with_chunks(message, content)
-    Discordrb.split_message(content).each do |chunk|
+    Discordrb.split_message(content).map do |chunk|
       message.reply!(chunk, mention_user: false)
     end
+  end
+
+  def transcription_request_key(request)
+    "#{request.fetch(:source_message).id}:#{normalized_whisper_model_value(request.fetch(:model))}"
   end
 end
 

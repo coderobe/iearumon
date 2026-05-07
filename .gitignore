@@ -1,2 +1,6 @@
+# settings
 .env
+
+# program state, do not edit manually
 iearumon_settings.json
+iearumon_transcriptions.json
