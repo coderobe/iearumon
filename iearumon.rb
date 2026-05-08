@@ -180,25 +180,31 @@ module Iearumon
         loop do
           content = nil
           placeholder_message = nil
+          stop = false
 
           @mutex.synchronize do
             while !@closed && @pending_rendered_content.nil?
               @condition.wait(@mutex)
             end
-            break if @closed
 
-            if @placeholder_message && @last_update_at
-              remaining = @min_edit_interval - (Time.now - @last_update_at)
-              if remaining.positive?
-                @condition.wait(@mutex, remaining)
-                next
+            if @closed
+              stop = true
+            else
+              if @placeholder_message && @last_update_at
+                remaining = @min_edit_interval - (Time.now - @last_update_at)
+                @condition.wait(@mutex, remaining) if remaining.positive?
+              end
+
+              if @closed
+                stop = true
+              elsif @pending_rendered_content
+                content = @pending_rendered_content
+                placeholder_message = @placeholder_message
               end
             end
-
-            content = @pending_rendered_content
-            placeholder_message = @placeholder_message
           end
 
+          break if stop
           next if content.nil?
 
           persisted_message = nil
@@ -236,18 +242,16 @@ module Iearumon
 
     def close_progress_updates
       flush_thread = nil
-      placeholder_message = nil
 
       @mutex.synchronize do
         @closed = true
         @pending_rendered_content = nil
         flush_thread = @flush_thread
-        placeholder_message = @placeholder_message
         @condition.broadcast
       end
 
       flush_thread&.join
-      placeholder_message
+      @mutex.synchronize { @placeholder_message }
     end
   end
 
