@@ -91,6 +91,7 @@ module Iearumon
       @preview_word_count = preview_word_count
       @min_edit_interval = min_edit_interval
       @mutex = Mutex.new
+      @condition = ConditionVariable.new
       @partial_segments = []
       @placeholder_message = nil
       @last_rendered_content = nil
@@ -112,65 +113,37 @@ module Iearumon
         return unless enough_words_for_preview?(partial_text)
 
         rendered_content = render_progress_content(partial_text)
-        return if rendered_content == @last_rendered_content
+        return if rendered_content == @last_rendered_content || rendered_content == @pending_rendered_content
 
-        now = Time.now
-        if @placeholder_message
-          if @last_update_at && (now - @last_update_at) < @min_edit_interval
-            @pending_rendered_content = rendered_content
-            ensure_flush_thread_running
-            return
-          end
-
-          update_placeholder(rendered_content)
-        else
-          create_placeholder(rendered_content)
-        end
-
-        @last_rendered_content = rendered_content
-        @last_update_at = now
+        @pending_rendered_content = rendered_content
+        ensure_flush_thread_running
+        @condition.signal
       end
-    rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError => e
-      Iearumon.log_warn(
-        "could not update streaming transcription reply",
-        Iearumon.message_log_context(
-          @reply_to_message,
-          error_class: e.class.name,
-          error: e.message
-        )
-      )
     end
 
     def complete(final_transcript)
       transcript = final_transcript.to_s
-      @mutex.synchronize do
-        @closed = true
-        @pending_rendered_content = nil
-      end
+      placeholder_message = close_progress_updates
 
-      return Iearumon.reply_with_chunks(@reply_to_message, transcript) unless @placeholder_message
+      return Iearumon.reply_with_chunks(@reply_to_message, transcript) unless placeholder_message
 
       chunks = Discordrb.split_message(transcript)
       return [] if chunks.empty?
 
       begin
-        @placeholder_message.edit(chunks.shift)
+        placeholder_message.edit(chunks.shift)
       rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError
         return Iearumon.reply_with_chunks(@reply_to_message, transcript)
       end
 
-      [@placeholder_message, *chunks.map { |chunk| @reply_to_message.reply!(chunk, mention_user: false) }]
+      [placeholder_message, *chunks.map { |chunk| @reply_to_message.reply!(chunk, mention_user: false) }]
     end
 
     def display_failure(content)
-      @mutex.synchronize do
-        @closed = true
-        @pending_rendered_content = nil
-        return false unless @placeholder_message
+      placeholder_message = close_progress_updates
+      return false unless placeholder_message
 
-        @placeholder_message.edit(content)
-      end
-
+      placeholder_message.edit(content)
       true
     rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError => e
       Iearumon.log_warn(
@@ -205,43 +178,76 @@ module Iearumon
 
       @flush_thread = Thread.new do
         loop do
-          sleep_duration = nil
-          should_stop = false
+          content = nil
+          placeholder_message = nil
 
           @mutex.synchronize do
-            if @closed || @pending_rendered_content.nil?
-              should_stop = true
+            while !@closed && @pending_rendered_content.nil?
+              @condition.wait(@mutex)
+            end
+            break if @closed
+
+            if @placeholder_message && @last_update_at
+              remaining = @min_edit_interval - (Time.now - @last_update_at)
+              if remaining.positive?
+                @condition.wait(@mutex, remaining)
+                next
+              end
+            end
+
+            content = @pending_rendered_content
+            placeholder_message = @placeholder_message
+          end
+
+          next if content.nil?
+
+          persisted_message = nil
+          success = false
+          begin
+            if placeholder_message
+              placeholder_message.edit(content)
             else
-              sleep_duration = [@min_edit_interval - (Time.now - @last_update_at), 0].max
+              persisted_message = @reply_to_message.reply!(content, mention_user: false)
+            end
+            success = true
+          rescue Discordrb::Errors::NoPermission, Discordrb::Errors::CodeError => e
+            Iearumon.log_warn(
+              "could not update streaming transcription reply",
+              Iearumon.message_log_context(
+                @reply_to_message,
+                error_class: e.class.name,
+                error: e.message
+              )
+            )
+          ensure
+            @mutex.synchronize do
+              @placeholder_message ||= persisted_message if persisted_message
+              @pending_rendered_content = nil if @pending_rendered_content == content
+              if success
+                @last_rendered_content = content
+                @last_update_at = Time.now
+              end
+              @condition.broadcast
             end
           end
-
-          break if should_stop
-          sleep(sleep_duration) if sleep_duration.positive?
-
-          should_stop = false
-          @mutex.synchronize do
-            if @closed || @pending_rendered_content.nil?
-              should_stop = true
-            elsif !(@last_update_at && (Time.now - @last_update_at) < @min_edit_interval)
-              update_placeholder(@pending_rendered_content)
-              @pending_rendered_content = nil
-            end
-          end
-
-          break if should_stop
         end
       end
     end
 
-    def create_placeholder(content)
-      @placeholder_message = @reply_to_message.reply!(content, mention_user: false)
-    end
+    def close_progress_updates
+      flush_thread = nil
+      placeholder_message = nil
 
-    def update_placeholder(content)
-      @placeholder_message.edit(content)
-      @last_rendered_content = content
-      @last_update_at = Time.now
+      @mutex.synchronize do
+        @closed = true
+        @pending_rendered_content = nil
+        flush_thread = @flush_thread
+        placeholder_message = @placeholder_message
+        @condition.broadcast
+      end
+
+      flush_thread&.join
+      placeholder_message
     end
   end
 
