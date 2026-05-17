@@ -23,6 +23,7 @@ module Iearumon
   DEFAULT_WHISPER_COMMAND = "whisper"
   DEFAULT_WHISPER_MODEL = "base"
   DEFAULT_MAX_WHISPER_MODEL = "large"
+  DEFAULT_MIN_WHISPER_MODEL = "tiny"
 #  DEFAULT_WHISPER_MODEL = "small"
 #  DEFAULT_WHISPER_MODEL = "medium"
   DEFAULT_DOWNLOAD_OPEN_TIMEOUT = 15
@@ -35,6 +36,7 @@ module Iearumon
   DEFAULT_PROGRESS_PREVIEW_WORDS = 5
   DEFAULT_PROGRESS_UPDATE_INTERVAL = 5
   EAR_EMOJI = "👂"
+  INTERROBANG_EMOJI = "⁉️"
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
   SLASH_COMMAND_NAME = :iearumon
@@ -49,11 +51,15 @@ module Iearumon
   DEFAULT_SERVER_SETTINGS = {
     "auto_listen" => true,
     "reaction_emoji" => EAR_EMOJI,
+    "downgrade_reaction_emoji" => INTERROBANG_EMOJI,
+    "downgrade_reaction_enabled" => true,
     "stats" => DEFAULT_SERVER_STATS
   }.freeze
   DEFAULT_DM_SETTINGS = {
     "auto_listen" => true,
-    "reaction_emoji" => EAR_EMOJI
+    "reaction_emoji" => EAR_EMOJI,
+    "downgrade_reaction_emoji" => INTERROBANG_EMOJI,
+    "downgrade_reaction_enabled" => true
   }.freeze
   QUESTION_MARK_REACTIONS = Set["?", "❓", "❔"].freeze
   WHISPER_MODELS_BY_RANK = {
@@ -291,7 +297,8 @@ module Iearumon
       begin
         next if bot_user?(event.user)
         next if dm_ignored?(event.message)
-        next if handle_retry_reaction(bot, event.message, event.emoji)
+        retry_direction = retry_direction_for(event.message, event.emoji)
+        next if retry_direction && handle_retry_reaction(bot, event.message, retry_direction)
         next unless voice_note_message?(event.message)
         next unless reaction_matches?(event.emoji, reaction_emoji_for(event.message))
 
@@ -409,8 +416,10 @@ module Iearumon
         subcommand.boolean("enabled", "Whether iearumon should automatically transcribe new voice notes", required: true)
       end
 
-      command.subcommand("emoji", "Set the reaction emoji used for manual transcription") do |subcommand|
-        subcommand.string("value", "Emoji to use for reactions, like 👂 or :custom_emoji:", required: true)
+      command.subcommand("emoji", "Set manual or downgrade reaction emoji settings") do |subcommand|
+        subcommand.string("target", "Which reaction setting to change", required: false, choices: ["manual", "downgrade"])
+        subcommand.string("value", "Emoji to use for reactions, like 👂, ⁉️, or :custom_emoji:", required: false)
+        subcommand.boolean("enabled", "Whether downgrade retry reactions should be enabled", required: false)
       end
     end
   end
@@ -450,18 +459,51 @@ module Iearumon
     command.subcommand(:emoji) do |event|
       authorize_settings_change!(event)
 
+      target = normalized_emoji_target(event.options["target"])
       emoji = event.options["value"].to_s.strip
-      if emoji.empty?
-        event.respond(content: "Please provide an emoji to use for reactions.", ephemeral: true)
+      downgrade_enabled = event.options["enabled"]
+
+      if target == "manual"
+        if !downgrade_enabled.nil?
+          event.respond(content: "The enabled option can only be used with the downgrade target.", ephemeral: true)
+          next
+        end
+
+        if emoji.empty?
+          event.respond(content: "Please provide an emoji to use for reactions.", ephemeral: true)
+          next
+        end
+
+        settings = update_settings_for(event) do |current|
+          current.merge("reaction_emoji" => emoji)
+        end
+
+        event.respond(
+          content: "Manual transcription emoji set to #{settings.fetch("reaction_emoji")} for #{settings_scope_label(event)}.",
+          ephemeral: true
+        )
+        next
+      end
+
+      unless target == "downgrade"
+        event.respond(content: "Please choose either the manual or downgrade target.", ephemeral: true)
+        next
+      end
+
+      if emoji.empty? && downgrade_enabled.nil?
+        event.respond(content: "Provide a new emoji, an enabled value, or both for the downgrade target.", ephemeral: true)
         next
       end
 
       settings = update_settings_for(event) do |current|
-        current.merge("reaction_emoji" => emoji)
+        updates = {}
+        updates["downgrade_reaction_emoji"] = emoji unless emoji.empty?
+        updates["downgrade_reaction_enabled"] = !!downgrade_enabled unless downgrade_enabled.nil?
+        current.merge(updates)
       end
 
       event.respond(
-        content: "Reaction emoji set to #{settings.fetch("reaction_emoji")} for #{settings_scope_label(event)}.",
+        content: "Downgrade retry is now **#{settings.fetch("downgrade_reaction_enabled") ? "enabled" : "disabled"}** with #{settings.fetch("downgrade_reaction_emoji")} for #{settings_scope_label(event)}.",
         ephemeral: true
       )
     rescue AuthorizationError => e
@@ -518,6 +560,14 @@ module Iearumon
 
   def reaction_emoji_for(message)
     settings_for(message).fetch("reaction_emoji")
+  end
+
+  def downgrade_reaction_emoji_for(message)
+    settings_for(message).fetch("downgrade_reaction_emoji")
+  end
+
+  def downgrade_reaction_enabled?(message)
+    settings_for(message).fetch("downgrade_reaction_enabled")
   end
 
   def transcription_request_for(source_message, reply_to_message: source_message, model: default_whisper_model)
@@ -590,15 +640,15 @@ module Iearumon
     end
   end
 
-  def claim_retry_reaction_for(message_id)
+  def claim_retry_reaction_for(message_id, direction)
     @transcription_records_mutex.synchronize do
       records = read_transcription_records
       record_key = message_id.to_s
       record = records[record_key]
       return [:missing, nil] unless record
-      return [:already_handled, record] if record["retry_requested_at"]
+      return [:already_handled, record] if retry_request_already_handled?(record, direction)
 
-      updated_record = record.merge("retry_requested_at" => Time.now.utc.iso8601)
+      updated_record = record.merge(retry_request_timestamp_key(direction) => Time.now.utc.iso8601)
       records[record_key] = updated_record
       write_transcription_records(records)
       [:claimed, updated_record]
@@ -674,30 +724,48 @@ module Iearumon
   end
 
   def reaction_matches?(emoji, configured_emoji)
-    reaction_string(emoji) == configured_emoji
+    normalized_reaction_string(emoji) == normalized_reaction_string(configured_emoji)
   end
 
   def retry_reaction?(emoji)
-    QUESTION_MARK_REACTIONS.include?(reaction_string(emoji))
+    QUESTION_MARK_REACTIONS.include?(normalized_reaction_string(emoji))
+  end
+
+  def downgrade_retry_reaction?(message, emoji)
+    downgrade_reaction_enabled?(message) && reaction_matches?(emoji, downgrade_reaction_emoji_for(message))
   end
 
   def reaction_string(emoji)
     emoji.respond_to?(:to_reaction) ? emoji.to_reaction.to_s : emoji.to_s
   end
 
-  def handle_retry_reaction(bot, reacted_message, emoji)
-    return false unless retry_reaction?(emoji)
+  def normalized_reaction_string(emoji)
+    value = reaction_string(emoji).strip
+    return value if value.start_with?("<:") || value.start_with?("<a:")
 
-    retry_claim, retry_record = claim_retry_reaction_for(reacted_message.id)
+    value.delete("\uFE0E\uFE0F")
+  end
+
+  def retry_direction_for(message, emoji)
+    return :upgrade if retry_reaction?(emoji)
+    return :downgrade if downgrade_retry_reaction?(message, emoji)
+
+    nil
+  end
+
+  def handle_retry_reaction(bot, reacted_message, direction)
+    return false unless direction
+
+    retry_claim, retry_record = claim_retry_reaction_for(reacted_message.id, direction)
     return false if retry_claim == :missing
     return true if retry_claim == :already_handled
 
-    current_model = current_retry_model_for(retry_record)
+    current_model = current_retry_model_for(retry_record, direction)
     return true unless current_model
 
-    next_model = next_retry_whisper_model(current_model)
+    next_model = retry_target_whisper_model(current_model, direction)
     unless next_model
-      reply_with_chunks(reacted_message, "-# that's all i've got, you're on your own now")
+      reply_with_chunks(reacted_message, retry_limit_message(direction))
       return true
     end
 
@@ -711,18 +779,48 @@ module Iearumon
     reservation_key = reserve_transcription_request(request)
     return true unless reservation_key
 
-    reply_with_chunks(reacted_message, "-# got ? react. hold on, trying harder.")
+    reply_with_chunks(reacted_message, retry_requested_message(direction))
     enqueue_reserved_transcription(bot, request, reservation_key)
     true
   end
 
-  def current_retry_model_for(retry_record)
+  def current_retry_model_for(retry_record, direction)
     reacted_model = normalized_whisper_model_value(retry_record.fetch("model"))
+    return nil unless whisper_model_rank(reacted_model)
+    return reacted_model unless direction == :upgrade
+
     highest_model = highest_transcription_model_for_source(retry_record.fetch("source_message_id"))
     return reacted_model unless highest_model
     return nil if whisper_model_rank(highest_model) > whisper_model_rank(reacted_model)
 
     reacted_model
+  end
+
+  def retry_target_whisper_model(current_model, direction)
+    case direction
+    when :upgrade
+      next_retry_whisper_model(current_model)
+    when :downgrade
+      previous_retry_whisper_model(current_model)
+    end
+  end
+
+  def retry_requested_message(direction)
+    case direction
+    when :upgrade
+      "-# got ? react. hold on, trying harder."
+    when :downgrade
+      "-# got #{INTERROBANG_EMOJI} react. hold on, trying smaller."
+    end
+  end
+
+  def retry_limit_message(direction)
+    case direction
+    when :upgrade
+      "-# that's all i've got, you're on your own now"
+    when :downgrade
+      "-# that's the smallest model i've got for that voice note"
+    end
   end
 
   def resolve_retry_source_message(bot, reacted_message, retry_record)
@@ -965,16 +1063,26 @@ module Iearumon
 
   def max_retry_whisper_model
     @max_retry_whisper_model ||= begin
-      configured_model = ENV.fetch("IEARUMON_MAX_WHISPER_MODEL", DEFAULT_MAX_WHISPER_MODEL).to_s.strip
-      configured_model = DEFAULT_MAX_WHISPER_MODEL if configured_model.empty?
-      rank = whisper_model_rank(configured_model)
-      unless rank
-        raise ConfigurationError,
-              "IEARUMON_MAX_WHISPER_MODEL must be one of tiny, base, small, medium, large, large-v1, large-v2, large-v3, or turbo."
-      end
-
-      WHISPER_MODELS_BY_RANK.fetch(rank)
+      configured_retry_whisper_model("IEARUMON_MAX_WHISPER_MODEL", DEFAULT_MAX_WHISPER_MODEL)
     end
+  end
+
+  def min_retry_whisper_model
+    @min_retry_whisper_model ||= begin
+      configured_retry_whisper_model("IEARUMON_MIN_WHISPER_MODEL", DEFAULT_MIN_WHISPER_MODEL)
+    end
+  end
+
+  def configured_retry_whisper_model(env_name, default)
+    configured_model = ENV.fetch(env_name, default).to_s.strip
+    configured_model = default if configured_model.empty?
+    rank = whisper_model_rank(configured_model)
+    unless rank
+      raise ConfigurationError,
+            "#{env_name} must be one of tiny, base, small, medium, large, large-v1, large-v2, large-v3, or turbo."
+    end
+
+    WHISPER_MODELS_BY_RANK.fetch(rank)
   end
 
   def next_retry_whisper_model(current_model)
@@ -985,6 +1093,16 @@ module Iearumon
     return nil if next_rank > whisper_model_rank(max_retry_whisper_model)
 
     WHISPER_MODELS_BY_RANK[next_rank]
+  end
+
+  def previous_retry_whisper_model(current_model)
+    current_rank = whisper_model_rank(current_model)
+    return nil unless current_rank
+
+    previous_rank = current_rank - 1
+    return nil if previous_rank < whisper_model_rank(min_retry_whisper_model)
+
+    WHISPER_MODELS_BY_RANK[previous_rank]
   end
 
   def download_read_timeout
@@ -1145,6 +1263,11 @@ module Iearumon
 
     embed.add_field(name: "Listening", value: enabled_label(settings.fetch("auto_listen")), inline: true)
     embed.add_field(name: "Trigger emoji", value: settings.fetch("reaction_emoji"), inline: true)
+    embed.add_field(
+      name: "Downgrade retry",
+      value: "#{enabled_label(settings.fetch("downgrade_reaction_enabled"))}\n#{settings.fetch("downgrade_reaction_emoji")}",
+      inline: true
+    )
 
     if context.server
       stats = settings.fetch("stats")
@@ -1156,14 +1279,14 @@ module Iearumon
       )
       embed.add_field(
         name: "How it works",
-        value: "New voice notes are transcribed automatically when listening is enabled.\nYou can always react with #{settings.fetch("reaction_emoji")} to trigger a manual transcription.",
+        value: "New voice notes are transcribed automatically when listening is enabled.\nReact with #{settings.fetch("reaction_emoji")} to trigger a manual transcription, or with ?, ❓, or ❔ on a transcription reply to try a larger model#{downgrade_status_sentence(settings)}.",
         inline: false
       )
     else
       embed.add_field(name: "DM access", value: enabled_label(global_dm_enabled?), inline: true)
       embed.add_field(
         name: "How it works",
-        value: global_dm_enabled? ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes." : "Set `IEARUMON_DM_ENABLED=true` in the bot environment to allow DM interactions.",
+        value: global_dm_enabled? ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes. Use ?, ❓, or ❔ on a transcription reply to try a larger model#{downgrade_status_sentence(settings)}" : "Set `IEARUMON_DM_ENABLED=true` in the bot environment to allow DM interactions.",
         inline: false
       )
     end
@@ -1173,6 +1296,12 @@ module Iearumon
 
   def enabled_label(enabled)
     enabled ? "Enabled" : "Disabled"
+  end
+
+  def downgrade_status_sentence(settings)
+    return "." unless settings.fetch("downgrade_reaction_enabled")
+
+    ", and react with #{settings.fetch("downgrade_reaction_emoji")} on a transcription reply to try a smaller model."
   end
 
   def duration_summary(total_seconds)
@@ -1226,6 +1355,28 @@ module Iearumon
 
   def format_log_value(value)
     value.is_a?(String) ? value.inspect : value
+  end
+
+  def normalized_emoji_target(target)
+    value = target.to_s.strip.downcase
+    value.empty? ? "manual" : value
+  end
+
+  def retry_request_timestamp_key(direction)
+    case direction
+    when :upgrade
+      "upgrade_requested_at"
+    when :downgrade
+      "downgrade_requested_at"
+    else
+      raise ArgumentError, "Unsupported retry direction: #{direction.inspect}"
+    end
+  end
+
+  def retry_request_already_handled?(record, direction)
+    return true if record[retry_request_timestamp_key(direction)]
+
+    direction == :upgrade && record["retry_requested_at"]
   end
 
   def user_configuration_error_message(context)
