@@ -421,7 +421,16 @@ module Iearumon
       end
 
       command.subcommand("emoji", "Set manual or retry reaction settings") do |subcommand|
-        subcommand.string("target", "Which reaction setting to change", required: false, choices: ["manual", "upgrade", "downgrade"])
+        subcommand.string(
+          "target",
+          "Which reaction setting to change",
+          required: false,
+          choices: {
+            "manual" => "manual",
+            "upgrade" => "upgrade",
+            "downgrade" => "downgrade"
+          }
+        )
         subcommand.string("value", "Emoji or emojis to use for reactions. For upgrade, separate multiple emojis with spaces or commas.", required: false)
         subcommand.boolean("enabled", "Whether the selected retry reaction should be enabled", required: false)
       end
