@@ -47,11 +47,11 @@ Discord bot that transcribes Discord voice notes with a local Whisper CLI.
 - Longer transcriptions stream into a single in-progress reply that is edited conservatively until the final text is ready
 - DMs are controlled globally with `IEARUMON_DM_ENABLED` and are disabled by default
 - Manual transcription is triggered by reacting with `👂`
-- Reacting with `?`, `❓`, or `❔` on one of the bot's transcription replies retries that voice note with the next larger Whisper model, up to `IEARUMON_MAX_WHISPER_MODEL`
+- Reacting with the configured upgrade retry emoji set (default: `?`, `❓`, `❔`) on one of the bot's transcription replies retries that voice note with the next larger Whisper model, up to `IEARUMON_MAX_WHISPER_MODEL`
 - Reacting with `⁉️` on one of the bot's transcription replies retries that voice note with the next smaller Whisper model, down to `IEARUMON_MIN_WHISPER_MODEL`
 - Per-server transcription totals and per-scope settings are stored in `iearumon_settings.json`
 - Server-wide `/iearumon listen` and `/iearumon emoji` changes require the Discord `Manage Server` permission
-- `/iearumon emoji` can change the manual trigger emoji, or target the downgrade retry emoji and enable or disable that retry path per scope
+- `/iearumon emoji` can change the manual trigger emoji, configure or toggle the upgrade retry emoji set, or target the downgrade retry emoji and enable or disable that retry path per scope
 - Slash commands: `/iearumon status`, `/iearumon listen`, `/iearumon emoji`
 
 ## Optional safety tuning

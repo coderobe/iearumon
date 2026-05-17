@@ -37,6 +37,7 @@ module Iearumon
   DEFAULT_PROGRESS_UPDATE_INTERVAL = 5
   EAR_EMOJI = "👂"
   INTERROBANG_EMOJI = "⁉️"
+  DEFAULT_UPGRADE_REACTION_EMOJIS = ["?", "❓", "❔"].freeze
   SETTINGS_PATH = File.expand_path("iearumon_settings.json", __dir__)
   TRANSCRIPTION_DEDUP_TTL = 300
   SLASH_COMMAND_NAME = :iearumon
@@ -51,6 +52,8 @@ module Iearumon
   DEFAULT_SERVER_SETTINGS = {
     "auto_listen" => true,
     "reaction_emoji" => EAR_EMOJI,
+    "upgrade_reaction_emojis" => DEFAULT_UPGRADE_REACTION_EMOJIS,
+    "upgrade_reaction_enabled" => true,
     "downgrade_reaction_emoji" => INTERROBANG_EMOJI,
     "downgrade_reaction_enabled" => true,
     "stats" => DEFAULT_SERVER_STATS
@@ -58,10 +61,11 @@ module Iearumon
   DEFAULT_DM_SETTINGS = {
     "auto_listen" => true,
     "reaction_emoji" => EAR_EMOJI,
+    "upgrade_reaction_emojis" => DEFAULT_UPGRADE_REACTION_EMOJIS,
+    "upgrade_reaction_enabled" => true,
     "downgrade_reaction_emoji" => INTERROBANG_EMOJI,
     "downgrade_reaction_enabled" => true
   }.freeze
-  QUESTION_MARK_REACTIONS = Set["?", "❓", "❔"].freeze
   WHISPER_MODELS_BY_RANK = {
     0 => "tiny",
     1 => "base",
@@ -416,10 +420,10 @@ module Iearumon
         subcommand.boolean("enabled", "Whether iearumon should automatically transcribe new voice notes", required: true)
       end
 
-      command.subcommand("emoji", "Set manual or downgrade reaction emoji settings") do |subcommand|
-        subcommand.string("target", "Which reaction setting to change", required: false, choices: ["manual", "downgrade"])
-        subcommand.string("value", "Emoji to use for reactions, like 👂, ⁉️, or :custom_emoji:", required: false)
-        subcommand.boolean("enabled", "Whether downgrade retry reactions should be enabled", required: false)
+      command.subcommand("emoji", "Set manual or retry reaction settings") do |subcommand|
+        subcommand.string("target", "Which reaction setting to change", required: false, choices: ["manual", "upgrade", "downgrade"])
+        subcommand.string("value", "Emoji or emojis to use for reactions. For upgrade, separate multiple emojis with spaces or commas.", required: false)
+        subcommand.boolean("enabled", "Whether the selected retry reaction should be enabled", required: false)
       end
     end
   end
@@ -461,11 +465,11 @@ module Iearumon
 
       target = normalized_emoji_target(event.options["target"])
       emoji = event.options["value"].to_s.strip
-      downgrade_enabled = event.options["enabled"]
+      retry_enabled = event.options["enabled"]
 
       if target == "manual"
-        if !downgrade_enabled.nil?
-          event.respond(content: "The enabled option can only be used with the downgrade target.", ephemeral: true)
+        if !retry_enabled.nil?
+          event.respond(content: "The enabled option can only be used with the upgrade or downgrade target.", ephemeral: true)
           next
         end
 
@@ -485,12 +489,34 @@ module Iearumon
         next
       end
 
-      unless target == "downgrade"
-        event.respond(content: "Please choose either the manual or downgrade target.", ephemeral: true)
+      if target == "upgrade"
+        if emoji.empty? && retry_enabled.nil?
+          event.respond(content: "Provide one or more emojis, an enabled value, or both for the upgrade target.", ephemeral: true)
+          next
+        end
+
+        upgrade_emojis = emoji.empty? ? nil : parse_reaction_emoji_list(emoji)
+
+        settings = update_settings_for(event) do |current|
+          updates = {}
+          updates["upgrade_reaction_emojis"] = upgrade_emojis if upgrade_emojis
+          updates["upgrade_reaction_enabled"] = !!retry_enabled unless retry_enabled.nil?
+          current.merge(updates)
+        end
+
+        event.respond(
+          content: "Upgrade retry is now **#{settings.fetch("upgrade_reaction_enabled") ? "enabled" : "disabled"}** with #{format_reaction_emoji_list(settings.fetch("upgrade_reaction_emojis"))} for #{settings_scope_label(event)}.",
+          ephemeral: true
+        )
         next
       end
 
-      if emoji.empty? && downgrade_enabled.nil?
+      unless target == "downgrade"
+        event.respond(content: "Please choose the manual, upgrade, or downgrade target.", ephemeral: true)
+        next
+      end
+
+      if emoji.empty? && retry_enabled.nil?
         event.respond(content: "Provide a new emoji, an enabled value, or both for the downgrade target.", ephemeral: true)
         next
       end
@@ -498,7 +524,7 @@ module Iearumon
       settings = update_settings_for(event) do |current|
         updates = {}
         updates["downgrade_reaction_emoji"] = emoji unless emoji.empty?
-        updates["downgrade_reaction_enabled"] = !!downgrade_enabled unless downgrade_enabled.nil?
+        updates["downgrade_reaction_enabled"] = !!retry_enabled unless retry_enabled.nil?
         current.merge(updates)
       end
 
@@ -562,6 +588,14 @@ module Iearumon
     settings_for(message).fetch("reaction_emoji")
   end
 
+  def upgrade_reaction_enabled?(message)
+    settings_for(message).fetch("upgrade_reaction_enabled")
+  end
+
+  def upgrade_reaction_emojis_for(message)
+    settings_for(message).fetch("upgrade_reaction_emojis")
+  end
+
   def downgrade_reaction_emoji_for(message)
     settings_for(message).fetch("downgrade_reaction_emoji")
   end
@@ -599,6 +633,10 @@ module Iearumon
 
   def normalize_settings(context, stored_settings)
     normalized = default_settings_for(context).merge(stored_settings)
+    normalized["upgrade_reaction_emojis"] = normalize_reaction_emoji_list(
+      stored_settings.fetch("upgrade_reaction_emojis", normalized.fetch("upgrade_reaction_emojis")),
+      default: DEFAULT_UPGRADE_REACTION_EMOJIS
+    )
     return normalized unless context.server
 
     normalized.merge("stats" => DEFAULT_SERVER_STATS.merge(stored_settings.fetch("stats", {})))
@@ -727,8 +765,9 @@ module Iearumon
     normalized_reaction_string(emoji) == normalized_reaction_string(configured_emoji)
   end
 
-  def retry_reaction?(emoji)
-    QUESTION_MARK_REACTIONS.include?(normalized_reaction_string(emoji))
+  def upgrade_retry_reaction?(message, emoji)
+    upgrade_reaction_enabled?(message) &&
+      upgrade_reaction_emojis_for(message).map { |reaction| normalized_reaction_string(reaction) }.include?(normalized_reaction_string(emoji))
   end
 
   def downgrade_retry_reaction?(message, emoji)
@@ -747,7 +786,7 @@ module Iearumon
   end
 
   def retry_direction_for(message, emoji)
-    return :upgrade if retry_reaction?(emoji)
+    return :upgrade if upgrade_retry_reaction?(message, emoji)
     return :downgrade if downgrade_retry_reaction?(message, emoji)
 
     nil
@@ -808,9 +847,9 @@ module Iearumon
   def retry_requested_message(direction)
     case direction
     when :upgrade
-      "-# got ? react. hold on, trying harder."
+      "-# got ? react. hold on, trying harder..."
     when :downgrade
-      "-# got #{INTERROBANG_EMOJI} react. hold on, trying smaller."
+      "-# got #{INTERROBANG_EMOJI} react. hold on, giving fewer fucks..."
     end
   end
 
@@ -819,7 +858,7 @@ module Iearumon
     when :upgrade
       "-# that's all i've got, you're on your own now"
     when :downgrade
-      "-# that's the smallest model i've got for that voice note"
+      "-# that's as low as it'll go"
     end
   end
 
@@ -1264,6 +1303,11 @@ module Iearumon
     embed.add_field(name: "Listening", value: enabled_label(settings.fetch("auto_listen")), inline: true)
     embed.add_field(name: "Trigger emoji", value: settings.fetch("reaction_emoji"), inline: true)
     embed.add_field(
+      name: "Upgrade retry",
+      value: "#{enabled_label(settings.fetch("upgrade_reaction_enabled"))}\n#{format_reaction_emoji_list(settings.fetch("upgrade_reaction_emojis"))}",
+      inline: true
+    )
+    embed.add_field(
       name: "Downgrade retry",
       value: "#{enabled_label(settings.fetch("downgrade_reaction_enabled"))}\n#{settings.fetch("downgrade_reaction_emoji")}",
       inline: true
@@ -1279,14 +1323,14 @@ module Iearumon
       )
       embed.add_field(
         name: "How it works",
-        value: "New voice notes are transcribed automatically when listening is enabled.\nReact with #{settings.fetch("reaction_emoji")} to trigger a manual transcription, or with ?, ❓, or ❔ on a transcription reply to try a larger model#{downgrade_status_sentence(settings)}.",
+        value: "New voice notes are transcribed automatically when listening is enabled.\nReact with #{settings.fetch("reaction_emoji")} to trigger a manual transcription#{retry_status_sentence(settings)}",
         inline: false
       )
     else
       embed.add_field(name: "DM access", value: enabled_label(global_dm_enabled?), inline: true)
       embed.add_field(
         name: "How it works",
-        value: global_dm_enabled? ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes. Use ?, ❓, or ❔ on a transcription reply to try a larger model#{downgrade_status_sentence(settings)}" : "Set `IEARUMON_DM_ENABLED=true` in the bot environment to allow DM interactions.",
+        value: global_dm_enabled? ? "React to a voice note with #{settings.fetch("reaction_emoji")} or leave auto listening on for new voice notes#{retry_status_sentence(settings)}" : "Set `IEARUMON_DM_ENABLED=true` in the bot environment to allow DM interactions.",
         inline: false
       )
     end
@@ -1298,10 +1342,18 @@ module Iearumon
     enabled ? "Enabled" : "Disabled"
   end
 
-  def downgrade_status_sentence(settings)
-    return "." unless settings.fetch("downgrade_reaction_enabled")
+  def retry_status_sentence(settings)
+    fragments = []
+    if settings.fetch("upgrade_reaction_enabled")
+      fragments << "with #{format_reaction_emoji_list(settings.fetch("upgrade_reaction_emojis"))} on a transcription reply to try a larger model"
+    end
+    if settings.fetch("downgrade_reaction_enabled")
+      fragments << "with #{settings.fetch("downgrade_reaction_emoji")} on a transcription reply to try a smaller model"
+    end
 
-    ", and react with #{settings.fetch("downgrade_reaction_emoji")} on a transcription reply to try a smaller model."
+    return "." if fragments.empty?
+
+    ", or react #{fragments.join(', or ')}."
   end
 
   def duration_summary(total_seconds)
@@ -1360,6 +1412,33 @@ module Iearumon
   def normalized_emoji_target(target)
     value = target.to_s.strip.downcase
     value.empty? ? "manual" : value
+  end
+
+  def parse_reaction_emoji_list(raw_value)
+    emojis = normalize_reaction_emoji_list(raw_value, default: [])
+    raise ConfigurationError, "Provide at least one emoji." if emojis.empty?
+
+    emojis
+  end
+
+  def normalize_reaction_emoji_list(value, default:)
+    entries = case value
+              when Array
+                value
+              else
+                value.to_s.split(/[\s,]+/)
+              end
+
+    normalized = entries.filter_map do |entry|
+      reaction = normalized_reaction_string(entry)
+      reaction.empty? ? nil : reaction
+    end.uniq
+
+    normalized.empty? ? default.dup : normalized
+  end
+
+  def format_reaction_emoji_list(emojis)
+    normalize_reaction_emoji_list(emojis, default: DEFAULT_UPGRADE_REACTION_EMOJIS).join(", ")
   end
 
   def retry_request_timestamp_key(direction)
