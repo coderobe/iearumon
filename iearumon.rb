@@ -45,6 +45,7 @@ module Iearumon
   DM_EMBED_COLOR = 0xFEE75C
   VOICE_NOTE_FILENAME = "voice-message.ogg"
   STREAMING_TRANSCRIPTION_STATUS = " *[...]*\n-# this transcription is still being processed"
+  WORKER_CRASH_BACKOFF_SECONDS = 1
   DEFAULT_SERVER_STATS = {
     "total_transcriptions" => 0,
     "seconds_transcribed" => 0
@@ -284,13 +285,23 @@ module Iearumon
     register_slash_commands(bot)
     register_slash_handlers(bot)
 
+    # NOTE: discordrb dispatches these handlers on (or very close to) the
+    # gateway thread that also owns the heartbeat. Anything blocking in here
+    # (like a full SizedQueue#push, or an outbound HTTP call) can starve the
+    # heartbeat and cause Discord to close the connection. So the actual
+    # enqueueing/replying work is pushed onto its own Thread; only the cheap checks stay inline.
     bot.message do |event|
       begin
         next unless voice_note_message?(event.message)
         next if dm_ignored?(event.message)
         next unless auto_listen_enabled?(event.message)
 
-        enqueue_transcription(bot, transcription_request_for(event.message))
+        Thread.new do
+          enqueue_transcription(bot, transcription_request_for(event.message))
+        rescue ConfigurationError => e
+          bot.debug("message handling failed: #{e.class}: #{e.message}")
+          reply_with_chunks(event.message, user_configuration_error_message(event))
+        end
       rescue ConfigurationError => e
         bot.debug("message handling failed: #{e.class}: #{e.message}")
         reply_with_chunks(event.message, user_configuration_error_message(event))
@@ -301,12 +312,27 @@ module Iearumon
       begin
         next if bot_user?(event.user)
         next if dm_ignored?(event.message)
+
         retry_direction = retry_direction_for(event.message, event.emoji)
-        next if retry_direction && handle_retry_reaction(bot, event.message, retry_direction)
+        if retry_direction
+          Thread.new do
+            handle_retry_reaction(bot, event.message, retry_direction)
+          rescue ConfigurationError => e
+            bot.debug("reaction handling failed: #{e.class}: #{e.message}")
+            reply_with_chunks(event.message, user_configuration_error_message(event))
+          end
+          next
+        end
+
         next unless voice_note_message?(event.message)
         next unless reaction_matches?(event.emoji, reaction_emoji_for(event.message))
 
-        enqueue_transcription(bot, transcription_request_for(event.message))
+        Thread.new do
+          enqueue_transcription(bot, transcription_request_for(event.message))
+        rescue ConfigurationError => e
+          bot.debug("reaction handling failed: #{e.class}: #{e.message}")
+          reply_with_chunks(event.message, user_configuration_error_message(event))
+        end
       rescue ConfigurationError => e
         bot.debug("reaction handling failed: #{e.class}: #{e.message}")
         reply_with_chunks(event.message, user_configuration_error_message(event))
@@ -391,11 +417,31 @@ module Iearumon
     reservation_key
   end
 
+  # Pushes onto the transcription queue without blocking indefinitely. If the
+  # queue is full we drop the request, release its reservation (so the user
+  # can retry later without being silently deduped), and tell them we're backed up
   def enqueue_reserved_transcription(bot, request, reservation_key)
     return false if reservation_key.nil?
 
     ensure_transcription_workers_running(bot)
-    transcription_queue.push(request)
+
+    begin
+      transcription_queue.push(request, true)
+    rescue ThreadError
+      clear_transcription_reservation(reservation_key)
+      log_warn(
+        "transcription queue is full, dropping request",
+        message_log_context(
+          request.fetch(:source_message),
+          queue_depth: transcription_queue.length,
+          reply_to_message_id: request.fetch(:reply_to_message).id,
+          model: request.fetch(:model)
+        )
+      )
+      safely_reply_with_chunks(request.fetch(:reply_to_message), queue_full_message)
+      return false
+    end
+
     log_info(
       "queued voice note transcription",
       message_log_context(
@@ -406,6 +452,10 @@ module Iearumon
       )
     )
     true
+  end
+
+  def queue_full_message
+    "-# i'm swamped with transcriptions right now. try again in a bit."
   end
 
   def register_slash_commands(bot)
@@ -813,13 +863,13 @@ module Iearumon
 
     next_model = retry_target_whisper_model(current_model, direction)
     unless next_model
-      reply_with_chunks(reacted_message, retry_limit_message(direction))
+      safely_reply_with_chunks(reacted_message, retry_limit_message(direction))
       return true
     end
 
     source_message = resolve_retry_source_message(bot, reacted_message, retry_record)
     unless source_message
-      reply_with_chunks(reacted_message, "-# transcription requested but i can't find the original voice note anymore")
+      safely_reply_with_chunks(reacted_message, "-# transcription requested but i can't find the original voice note anymore")
       return true
     end
 
@@ -827,7 +877,7 @@ module Iearumon
     reservation_key = reserve_transcription_request(request)
     return true unless reservation_key
 
-    reply_with_chunks(reacted_message, retry_requested_message(direction))
+    safely_reply_with_chunks(reacted_message, retry_requested_message(direction))
     enqueue_reserved_transcription(bot, request, reservation_key)
     true
   end
@@ -1207,7 +1257,7 @@ module Iearumon
           message_log_context(request.fetch(:source_message), error_class: e.class.name, error: e.message, model: request.fetch(:model))
         )
         bot.debug("voice note transcription failed: #{e.class}: #{e.message}")
-        reply_with_chunks(request.fetch(:reply_to_message), user_transcription_error_message(e)) unless e.is_a?(DisplayedTranscriptionError)
+        safely_reply_with_chunks(request.fetch(:reply_to_message), user_transcription_error_message(e)) unless e.is_a?(DisplayedTranscriptionError)
       rescue StandardError => e
         log_warn(
           "voice note transcription failed unexpectedly",
@@ -1220,11 +1270,19 @@ module Iearumon
           )
         )
         bot.debug("voice note transcription failed unexpectedly: #{e.class}: #{e.message}")
-        reply_with_chunks(request.fetch(:reply_to_message), "-# i couldn't transcribe that voice note because an internal error occurred.")
+        safely_reply_with_chunks(request.fetch(:reply_to_message), "-# i couldn't transcribe that voice note because an internal error occurred.")
       ensure
-        completed ? mark_transcription_complete(reservation_key) : clear_transcription_reservation(reservation_key)
+        begin
+          completed ? mark_transcription_complete(reservation_key) : clear_transcription_reservation(reservation_key)
+        rescue StandardError => e
+          log_warn("failed to update transcription reservation state", error_class: e.class.name, error: e.message)
+        end
       end
     end
+  rescue StandardError => e
+    log_warn("transcription worker crashed, restarting", error_class: e.class.name, error: e.message)
+    sleep WORKER_CRASH_BACKOFF_SECONDS
+    retry
   end
 
   def capture_command_with_timeout(timeout_seconds, *command, env: {}, stdout_line_callback: nil)
@@ -1491,6 +1549,16 @@ module Iearumon
     Discordrb.split_message(content).map do |chunk|
       message.reply!(chunk, mention_user: false)
     end
+  end
+
+  # Like reply_with_chunks, but never raises. Used from spots (worker loop
+  # rescue branches, retry-reaction handling) where an outbound Discord API
+  # failure must not be allowed to propagate and take down the calling thread
+  def safely_reply_with_chunks(message, content)
+    reply_with_chunks(message, content)
+  rescue StandardError => e
+    log_warn("could not send reply", message_log_context(message, error_class: e.class.name, error: e.message))
+    []
   end
 
   def progress_preview_words
